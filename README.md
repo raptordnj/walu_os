@@ -98,6 +98,7 @@ docker run --rm -it -v "$PWD":/workspace waluos make run-headless
 2. Create VM in VirtualBox:
    - Type: `Other/Unknown (64-bit)`
    - Memory: `256 MB`+
+   - Enable `EFI (special OSes only)`
 3. Attach ISO: `build/waluos.iso` as optical disk
 4. Boot VM
 

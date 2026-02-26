@@ -66,8 +66,10 @@ $(KERNEL_ELF): $(OBJS) $(RUST_LIB) linker.ld
 
 iso: $(KERNEL_ELF) grub/grub.cfg
 	mkdir -p $(ISO_ROOT)/boot/grub
+	mkdir -p $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL_ELF) $(ISO_ROOT)/boot/kernel.elf
 	cp grub/grub.cfg $(ISO_ROOT)/boot/grub/grub.cfg
+	grub-mkstandalone -O x86_64-efi -o $(ISO_ROOT)/EFI/BOOT/BOOTX64.EFI "boot/grub/grub.cfg=grub/grub.cfg"
 	grub-mkrescue -o $(ISO_IMAGE) $(ISO_ROOT)
 
 run: iso
