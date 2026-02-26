@@ -133,14 +133,30 @@ typedef struct {
     bool repeat;
 } key_event_t;
 
+typedef enum {
+    KBD_LAYOUT_US = 0,
+    KBD_LAYOUT_US_INTL = 1,
+} kbd_layout_t;
+
 void keyboard_init(void);
 void keyboard_on_irq(void);
 bool keyboard_pop_char(char *out);
 bool keyboard_pop_event(key_event_t *out);
 uint8_t keyboard_modifiers(void);
 uint8_t keyboard_locks(void);
+void keyboard_set_layout(kbd_layout_t layout);
+kbd_layout_t keyboard_layout(void);
+const char *keyboard_layout_name(void);
+bool keyboard_set_repeat(uint16_t delay_ms, uint16_t rate_hz);
+uint16_t keyboard_repeat_delay_ms(void);
+uint16_t keyboard_repeat_rate_hz(void);
+bool keyboard_unicode_compose_active(void);
+uint32_t keyboard_unicode_compose_value(void);
+uint8_t keyboard_unicode_compose_digits(void);
+const char *keyboard_keycode_name(keycode_t keycode);
 uint64_t keyboard_rx_scancodes(void);
 uint64_t keyboard_dropped_bytes(void);
 uint64_t keyboard_dropped_events(void);
+void keyboard_test_inject_scancode(uint8_t scancode);
 
 #endif

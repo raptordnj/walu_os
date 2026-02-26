@@ -5,6 +5,9 @@ This document defines the keyboard-to-terminal pipeline required for full keyboa
 ## Current implementation status (kernel prototype)
 - Implemented: scancode set 1 decode, extended `0xE0` keys, modifier/lock tracking.
 - Implemented: key-event queue and UTF-8 byte queue in keyboard layer.
+- Implemented: Unicode compose input (`Ctrl+Shift+U`, up to 6 hex digits, commit on Enter/Space).
+- Implemented: runtime keyboard controls (`kbdctl`) for layout (`us`, `us-intl`) and repeat delay/rate bounds.
+- Implemented: shell-side key-event ring buffer and inspection (`showkey`, `showkey live on|off`).
 - Implemented: canonical TTY line discipline with echo, backspace editing, and control handling.
 - Implemented: PTY ring-buffer skeleton (`pty_alloc`, master/slave read-write channels).
 - Implemented: fault counters for keyboard/TTY/PTY drop/overflow/invalid-op diagnostics.
@@ -12,7 +15,7 @@ This document defines the keyboard-to-terminal pipeline required for full keyboa
 - Implemented: console ANSI CSI subset (`m`, `A/B/C/D`, `H/f`, `J`, `K`, `s/u`).
 - Implemented: UTF-8 decode with safe fallback (`?`) for non-renderable glyphs.
 - Implemented: framebuffer 8x16 text rendering using 8x8 glyph atlas (Basic Latin).
-- Deferred: full grapheme clustering, compose/dead-key tables, full-width Unicode rendering.
+- Deferred: full grapheme clustering and full-width Unicode rendering.
 
 ## 1) Data flow
 1. Hardware IRQ delivers raw scan code bytes.
@@ -46,13 +49,21 @@ Lock bits:
 - `LOCK_NUM`
 - `LOCK_SCROLL`
 
-## 3) Kernel APIs (proposed)
+## 3) Kernel APIs (current)
 ```c
-int input_enqueue_scancode(uint8_t byte);
-int input_pop_event(key_event_t *out);
-int tty_push_key_event(int tty_id, const key_event_t *ev);
-int tty_read(int tty_id, void *buf, size_t len);
-int tty_write(int tty_id, const void *buf, size_t len);
+void keyboard_on_irq(void);
+bool keyboard_pop_char(char *out);
+bool keyboard_pop_event(key_event_t *out);
+void keyboard_set_layout(kbd_layout_t layout);
+kbd_layout_t keyboard_layout(void);
+const char *keyboard_layout_name(void);
+bool keyboard_set_repeat(uint16_t delay_ms, uint16_t rate_hz);
+uint16_t keyboard_repeat_delay_ms(void);
+uint16_t keyboard_repeat_rate_hz(void);
+bool keyboard_unicode_compose_active(void);
+uint32_t keyboard_unicode_compose_value(void);
+uint8_t keyboard_unicode_compose_digits(void);
+const char *keyboard_keycode_name(keycode_t keycode);
 ```
 
 ## 4) ANSI parser states
@@ -76,7 +87,7 @@ MVP control support:
 - reject overlong sequences and invalid scalar values.
 - current VGA fallback renders `?` when a glyph is not renderable.
 - width handling:
-  - MVP: single-width + basic wide-char table.
+  - MVP: single-cell rendering with ASCII/Basic-Latin glyph atlas; non-renderable code points fallback to `?`.
   - Phase 2: combining marks and improved East Asian width.
   - Phase 3: grapheme cluster aware cursor movement/editing.
 

@@ -5,6 +5,12 @@
 
 #define KBD_BYTE_QUEUE_SIZE 1024
 #define KBD_EVENT_QUEUE_SIZE 256
+#define KBD_UNICODE_MAX_HEX_DIGITS 6
+
+#define KBD_REPEAT_DELAY_MIN_MS 150
+#define KBD_REPEAT_DELAY_MAX_MS 2000
+#define KBD_REPEAT_RATE_MIN_HZ 1
+#define KBD_REPEAT_RATE_MAX_HZ 60
 
 static volatile uint8_t kbd_byte_queue[KBD_BYTE_QUEUE_SIZE];
 static volatile unsigned int kbd_byte_head = 0;
@@ -22,6 +28,15 @@ static bool kbd_key_down[KEY_MAX];
 static uint64_t kbd_rx_scancode_count = 0;
 static uint64_t kbd_drop_byte_count = 0;
 static uint64_t kbd_drop_event_count = 0;
+
+static kbd_layout_t kbd_layout = KBD_LAYOUT_US;
+static uint16_t kbd_repeat_delay_ms = 500;
+static uint16_t kbd_repeat_rate_hz = 30;
+
+static bool kbd_unicode_compose = false;
+static uint32_t kbd_unicode_compose_value_acc = 0;
+static uint8_t kbd_unicode_compose_digits_count = 0;
+static bool kbd_unicode_compose_overflow = false;
 
 static const keycode_t scancode_to_key[128] = {
     [0x01] = KEY_ESC,
@@ -130,6 +145,121 @@ static const keycode_t scancode_to_key_e0[128] = {
     [0x5C] = KEY_RIGHTMETA,
 };
 
+static const char *const keycode_names[KEY_MAX] = {
+    [KEY_NONE] = "NONE",
+    [KEY_ESC] = "ESC",
+    [KEY_1] = "1",
+    [KEY_2] = "2",
+    [KEY_3] = "3",
+    [KEY_4] = "4",
+    [KEY_5] = "5",
+    [KEY_6] = "6",
+    [KEY_7] = "7",
+    [KEY_8] = "8",
+    [KEY_9] = "9",
+    [KEY_0] = "0",
+    [KEY_MINUS] = "MINUS",
+    [KEY_EQUAL] = "EQUAL",
+    [KEY_BACKSPACE] = "BACKSPACE",
+    [KEY_TAB] = "TAB",
+    [KEY_Q] = "Q",
+    [KEY_W] = "W",
+    [KEY_E] = "E",
+    [KEY_R] = "R",
+    [KEY_T] = "T",
+    [KEY_Y] = "Y",
+    [KEY_U] = "U",
+    [KEY_I] = "I",
+    [KEY_O] = "O",
+    [KEY_P] = "P",
+    [KEY_LEFTBRACE] = "LEFTBRACE",
+    [KEY_RIGHTBRACE] = "RIGHTBRACE",
+    [KEY_ENTER] = "ENTER",
+    [KEY_LEFTCTRL] = "LEFTCTRL",
+    [KEY_A] = "A",
+    [KEY_S] = "S",
+    [KEY_D] = "D",
+    [KEY_F] = "F",
+    [KEY_G] = "G",
+    [KEY_H] = "H",
+    [KEY_J] = "J",
+    [KEY_K] = "K",
+    [KEY_L] = "L",
+    [KEY_SEMICOLON] = "SEMICOLON",
+    [KEY_APOSTROPHE] = "APOSTROPHE",
+    [KEY_GRAVE] = "GRAVE",
+    [KEY_LEFTSHIFT] = "LEFTSHIFT",
+    [KEY_BACKSLASH] = "BACKSLASH",
+    [KEY_Z] = "Z",
+    [KEY_X] = "X",
+    [KEY_C] = "C",
+    [KEY_V] = "V",
+    [KEY_B] = "B",
+    [KEY_N] = "N",
+    [KEY_M] = "M",
+    [KEY_COMMA] = "COMMA",
+    [KEY_DOT] = "DOT",
+    [KEY_SLASH] = "SLASH",
+    [KEY_RIGHTSHIFT] = "RIGHTSHIFT",
+    [KEY_KPASTERISK] = "KPASTERISK",
+    [KEY_LEFTALT] = "LEFTALT",
+    [KEY_SPACE] = "SPACE",
+    [KEY_CAPSLOCK] = "CAPSLOCK",
+    [KEY_F1] = "F1",
+    [KEY_F2] = "F2",
+    [KEY_F3] = "F3",
+    [KEY_F4] = "F4",
+    [KEY_F5] = "F5",
+    [KEY_F6] = "F6",
+    [KEY_F7] = "F7",
+    [KEY_F8] = "F8",
+    [KEY_F9] = "F9",
+    [KEY_F10] = "F10",
+    [KEY_NUMLOCK] = "NUMLOCK",
+    [KEY_SCROLLLOCK] = "SCROLLLOCK",
+    [KEY_KP7] = "KP7",
+    [KEY_KP8] = "KP8",
+    [KEY_KP9] = "KP9",
+    [KEY_KPMINUS] = "KPMINUS",
+    [KEY_KP4] = "KP4",
+    [KEY_KP5] = "KP5",
+    [KEY_KP6] = "KP6",
+    [KEY_KPPLUS] = "KPPLUS",
+    [KEY_KP1] = "KP1",
+    [KEY_KP2] = "KP2",
+    [KEY_KP3] = "KP3",
+    [KEY_KP0] = "KP0",
+    [KEY_KPDOT] = "KPDOT",
+    [KEY_F11] = "F11",
+    [KEY_F12] = "F12",
+    [KEY_RIGHTCTRL] = "RIGHTCTRL",
+    [KEY_RIGHTALT] = "RIGHTALT",
+    [KEY_HOME] = "HOME",
+    [KEY_UP] = "UP",
+    [KEY_PAGEUP] = "PAGEUP",
+    [KEY_LEFT] = "LEFT",
+    [KEY_RIGHT] = "RIGHT",
+    [KEY_END] = "END",
+    [KEY_DOWN] = "DOWN",
+    [KEY_PAGEDOWN] = "PAGEDOWN",
+    [KEY_INSERT] = "INSERT",
+    [KEY_DELETE] = "DELETE",
+    [KEY_LEFTMETA] = "LEFTMETA",
+    [KEY_RIGHTMETA] = "RIGHTMETA",
+    [KEY_KPENTER] = "KPENTER",
+    [KEY_KPSLASH] = "KPSLASH",
+};
+
+static bool kbd_is_valid_unicode_scalar(uint32_t codepoint) {
+    if (codepoint > 0x10FFFF) {
+        return false;
+    }
+    if (codepoint >= 0xD800 && codepoint <= 0xDFFF) {
+        return false;
+    }
+    return true;
+}
+
 static void kbd_push_byte(uint8_t byte) {
     unsigned int next = (kbd_byte_head + 1) % KBD_BYTE_QUEUE_SIZE;
     if (next == kbd_byte_tail) {
@@ -153,6 +283,10 @@ static void kbd_push_event(key_event_t event) {
 }
 
 static void kbd_emit_utf8(uint32_t codepoint) {
+    if (!kbd_is_valid_unicode_scalar(codepoint)) {
+        return;
+    }
+
     if (codepoint <= 0x7F) {
         kbd_push_byte((uint8_t)codepoint);
         return;
@@ -165,21 +299,16 @@ static void kbd_emit_utf8(uint32_t codepoint) {
     }
 
     if (codepoint <= 0xFFFF) {
-        if (codepoint >= 0xD800 && codepoint <= 0xDFFF) {
-            return;
-        }
         kbd_push_byte((uint8_t)(0xE0 | (codepoint >> 12)));
         kbd_push_byte((uint8_t)(0x80 | ((codepoint >> 6) & 0x3F)));
         kbd_push_byte((uint8_t)(0x80 | (codepoint & 0x3F)));
         return;
     }
 
-    if (codepoint <= 0x10FFFF) {
-        kbd_push_byte((uint8_t)(0xF0 | (codepoint >> 18)));
-        kbd_push_byte((uint8_t)(0x80 | ((codepoint >> 12) & 0x3F)));
-        kbd_push_byte((uint8_t)(0x80 | ((codepoint >> 6) & 0x3F)));
-        kbd_push_byte((uint8_t)(0x80 | (codepoint & 0x3F)));
-    }
+    kbd_push_byte((uint8_t)(0xF0 | (codepoint >> 18)));
+    kbd_push_byte((uint8_t)(0x80 | ((codepoint >> 12) & 0x3F)));
+    kbd_push_byte((uint8_t)(0x80 | ((codepoint >> 6) & 0x3F)));
+    kbd_push_byte((uint8_t)(0x80 | (codepoint & 0x3F)));
 }
 
 static void kbd_emit_sequence(const char *seq) {
@@ -252,10 +381,35 @@ static uint32_t kbd_apply_alpha(uint32_t lower, uint8_t modifiers, uint8_t locks
     return ch;
 }
 
+static uint32_t kbd_us_intl_altgr_unicode(keycode_t keycode) {
+    switch (keycode) {
+        case KEY_E:
+            return 0x20AC; /* Euro sign */
+        case KEY_2:
+            return 0x00B2;
+        case KEY_3:
+            return 0x00B3;
+        case KEY_4:
+            return 0x00A3;
+        case KEY_5:
+            return 0x00A5;
+        default:
+            return 0;
+    }
+}
+
 static uint32_t kbd_keycode_to_unicode(keycode_t keycode, uint8_t modifiers, uint8_t locks) {
     bool shift = (modifiers & KBD_MOD_SHIFT) != 0;
     bool ctrl = (modifiers & KBD_MOD_CTRL) != 0;
+    bool altgr = (modifiers & KBD_MOD_ALTGR) != 0;
     bool numlock = (locks & KBD_LOCK_NUM) != 0;
+
+    if (kbd_layout == KBD_LAYOUT_US_INTL && altgr) {
+        uint32_t cp = kbd_us_intl_altgr_unicode(keycode);
+        if (cp != 0) {
+            return cp;
+        }
+    }
 
     switch (keycode) {
         case KEY_A: return kbd_apply_alpha('a', modifiers, locks);
@@ -334,6 +488,107 @@ static uint32_t kbd_keycode_to_unicode(keycode_t keycode, uint8_t modifiers, uin
     }
 }
 
+static int kbd_hex_nibble_from_keycode(keycode_t keycode) {
+    switch (keycode) {
+        case KEY_0: return 0;
+        case KEY_1: return 1;
+        case KEY_2: return 2;
+        case KEY_3: return 3;
+        case KEY_4: return 4;
+        case KEY_5: return 5;
+        case KEY_6: return 6;
+        case KEY_7: return 7;
+        case KEY_8: return 8;
+        case KEY_9: return 9;
+        case KEY_A: return 10;
+        case KEY_B: return 11;
+        case KEY_C: return 12;
+        case KEY_D: return 13;
+        case KEY_E: return 14;
+        case KEY_F: return 15;
+        default:
+            return -1;
+    }
+}
+
+static void kbd_unicode_compose_reset(void) {
+    kbd_unicode_compose = false;
+    kbd_unicode_compose_value_acc = 0;
+    kbd_unicode_compose_digits_count = 0;
+    kbd_unicode_compose_overflow = false;
+}
+
+static void kbd_unicode_compose_commit(void) {
+    uint32_t cp = kbd_unicode_compose_value_acc;
+
+    if (kbd_unicode_compose_digits_count == 0 || kbd_unicode_compose_overflow || !kbd_is_valid_unicode_scalar(cp)) {
+        kbd_push_byte('?');
+        kbd_unicode_compose_reset();
+        return;
+    }
+
+    kbd_emit_utf8(cp);
+    kbd_unicode_compose_reset();
+}
+
+static bool kbd_handle_unicode_compose(const key_event_t *event) {
+    uint8_t compose_mods = KBD_MOD_CTRL | KBD_MOD_SHIFT;
+    int nibble;
+
+    if (!kbd_unicode_compose) {
+        if (event->pressed && event->keycode == KEY_U && (event->modifiers & compose_mods) == compose_mods) {
+            kbd_unicode_compose = true;
+            kbd_unicode_compose_value_acc = 0;
+            kbd_unicode_compose_digits_count = 0;
+            kbd_unicode_compose_overflow = false;
+            return true;
+        }
+        return false;
+    }
+
+    if (!event->pressed) {
+        return true;
+    }
+
+    if (event->keycode == KEY_ESC) {
+        kbd_unicode_compose_reset();
+        return true;
+    }
+
+    if (event->keycode == KEY_BACKSPACE) {
+        if (kbd_unicode_compose_digits_count > 0) {
+            kbd_unicode_compose_value_acc >>= 4;
+            kbd_unicode_compose_digits_count--;
+            kbd_unicode_compose_overflow = false;
+        } else {
+            kbd_unicode_compose_reset();
+        }
+        return true;
+    }
+
+    if (event->keycode == KEY_ENTER || event->keycode == KEY_KPENTER || event->keycode == KEY_SPACE) {
+        kbd_unicode_compose_commit();
+        return true;
+    }
+
+    nibble = kbd_hex_nibble_from_keycode(event->keycode);
+    if (nibble >= 0) {
+        if (kbd_unicode_compose_digits_count < KBD_UNICODE_MAX_HEX_DIGITS) {
+            kbd_unicode_compose_value_acc = (kbd_unicode_compose_value_acc << 4) | (uint32_t)nibble;
+            kbd_unicode_compose_digits_count++;
+            if (kbd_unicode_compose_value_acc > 0x10FFFFu) {
+                kbd_unicode_compose_overflow = true;
+            }
+        } else {
+            kbd_unicode_compose_overflow = true;
+        }
+        return true;
+    }
+
+    kbd_unicode_compose_reset();
+    return true;
+}
+
 static void kbd_emit_special_sequence(keycode_t keycode) {
     switch (keycode) {
         case KEY_UP: kbd_emit_sequence("\x1B[A"); break;
@@ -364,12 +619,16 @@ static void kbd_emit_special_sequence(keycode_t keycode) {
 }
 
 static void kbd_emit_input_bytes(const key_event_t *event) {
+    if (kbd_handle_unicode_compose(event)) {
+        return;
+    }
+
     if (!event->pressed) {
         return;
     }
 
     if (event->unicode != 0) {
-        if (event->modifiers & (KBD_MOD_ALT | KBD_MOD_ALTGR)) {
+        if (event->modifiers & KBD_MOD_ALT) {
             kbd_push_byte(0x1B);
         }
         kbd_emit_utf8(event->unicode);
@@ -388,6 +647,10 @@ void keyboard_init(void) {
     kbd_e1_skip = 0;
     kbd_modifiers = 0;
     kbd_locks = 0;
+    kbd_layout = KBD_LAYOUT_US;
+    kbd_repeat_delay_ms = 500;
+    kbd_repeat_rate_hz = 30;
+    kbd_unicode_compose_reset();
     kbd_rx_scancode_count = 0;
     kbd_drop_byte_count = 0;
     kbd_drop_event_count = 0;
@@ -397,8 +660,7 @@ void keyboard_init(void) {
     }
 }
 
-void keyboard_on_irq(void) {
-    uint8_t scancode = inb(KEYBOARD_DATA_PORT);
+static void keyboard_handle_scancode(uint8_t scancode) {
     bool released;
     uint8_t code;
     keycode_t keycode;
@@ -456,6 +718,10 @@ void keyboard_on_irq(void) {
     kbd_emit_input_bytes(&event);
 }
 
+void keyboard_on_irq(void) {
+    keyboard_handle_scancode(inb(KEYBOARD_DATA_PORT));
+}
+
 bool keyboard_pop_char(char *out) {
     if (kbd_byte_tail == kbd_byte_head) {
         return false;
@@ -484,6 +750,63 @@ uint8_t keyboard_locks(void) {
     return kbd_locks;
 }
 
+void keyboard_set_layout(kbd_layout_t layout) {
+    if (layout == KBD_LAYOUT_US || layout == KBD_LAYOUT_US_INTL) {
+        kbd_layout = layout;
+    }
+}
+
+kbd_layout_t keyboard_layout(void) {
+    return kbd_layout;
+}
+
+const char *keyboard_layout_name(void) {
+    if (kbd_layout == KBD_LAYOUT_US_INTL) {
+        return "us-intl";
+    }
+    return "us";
+}
+
+bool keyboard_set_repeat(uint16_t delay_ms, uint16_t rate_hz) {
+    if (delay_ms < KBD_REPEAT_DELAY_MIN_MS || delay_ms > KBD_REPEAT_DELAY_MAX_MS) {
+        return false;
+    }
+    if (rate_hz < KBD_REPEAT_RATE_MIN_HZ || rate_hz > KBD_REPEAT_RATE_MAX_HZ) {
+        return false;
+    }
+
+    kbd_repeat_delay_ms = delay_ms;
+    kbd_repeat_rate_hz = rate_hz;
+    return true;
+}
+
+uint16_t keyboard_repeat_delay_ms(void) {
+    return kbd_repeat_delay_ms;
+}
+
+uint16_t keyboard_repeat_rate_hz(void) {
+    return kbd_repeat_rate_hz;
+}
+
+bool keyboard_unicode_compose_active(void) {
+    return kbd_unicode_compose;
+}
+
+uint32_t keyboard_unicode_compose_value(void) {
+    return kbd_unicode_compose_value_acc;
+}
+
+uint8_t keyboard_unicode_compose_digits(void) {
+    return kbd_unicode_compose_digits_count;
+}
+
+const char *keyboard_keycode_name(keycode_t keycode) {
+    if (keycode > KEY_NONE && keycode < KEY_MAX && keycode_names[keycode] != 0) {
+        return keycode_names[keycode];
+    }
+    return "UNKNOWN";
+}
+
 uint64_t keyboard_rx_scancodes(void) {
     return kbd_rx_scancode_count;
 }
@@ -494,4 +817,8 @@ uint64_t keyboard_dropped_bytes(void) {
 
 uint64_t keyboard_dropped_events(void) {
     return kbd_drop_event_count;
+}
+
+void keyboard_test_inject_scancode(uint8_t scancode) {
+    keyboard_handle_scancode(scancode);
 }

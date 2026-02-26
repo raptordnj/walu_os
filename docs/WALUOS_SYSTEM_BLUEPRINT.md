@@ -360,11 +360,13 @@ Required key classes:
 Layout model:
 - default layout configured by `/etc/vconsole.conf`.
 - runtime keymap switching via `kbdctl set-layout <layout>`.
-- compose/dead-key support for accented and international input.
+- prototype supports `us` + `us-intl` layouts with bounded runtime switching.
+- prototype compose path: `Ctrl+Shift+U` then 1-6 hex digits, commit via Enter/Space.
 
 Kernel/userland boundary:
 - kernel owns scancode ingestion, repeat timing, key state.
-- userland owns layout packs, compose tables, locale policy.
+- long-term: userland owns layout packs/compose tables/locale policy.
+- current prototype: kernel still contains minimal layout and compose logic.
 
 ### 7.2 ANSI/VT control sequence support
 MVP parser support:
@@ -383,10 +385,10 @@ Phase 2:
 Encoding rules:
 - TTY and PTY streams are UTF-8 by default.
 - printable ASCII (`0x20..0x7E`) is strict subset and must remain exact.
-- invalid UTF-8 is replaced with U+FFFD in display path and logged in debug mode.
+- invalid UTF-8 is replaced with `?` in current display path.
 
 Display support milestones:
-- MVP: full ASCII input/output, UTF-8 pass-through, BMP subset rendering in framebuffer terminal.
+- MVP: full ASCII input/output, UTF-8 pass-through, framebuffer rendering with Basic-Latin glyph coverage.
 - Phase 2: wide-character width handling (CJK, combining marks basic support).
 - Phase 3: full Unicode line editing expectations (grapheme cluster aware cursor movement).
 
@@ -808,6 +810,13 @@ Commands:
   set-layout <layout>
   show-repeat
   set-repeat <delay_ms> <rate_hz>
+  show-compose
+```
+
+`showkey`:
+```text
+Usage: showkey [clear|live on|live off]
+Default mode prints buffered key events with keycode/modifier/unicode fields.
 ```
 
 ### C) File and API interface sketches
