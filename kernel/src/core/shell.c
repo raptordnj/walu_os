@@ -16,6 +16,7 @@
 
 static char shell_line[SHELL_LINE_MAX];
 static size_t shell_len = 0;
+static char shell_prev_dir[256];
 
 static key_event_t showkey_ring[SHOWKEY_RING_SIZE];
 static size_t showkey_head = 0;
@@ -100,6 +101,25 @@ static char *next_token(char **cursor) {
     }
     *cursor = p;
     return start;
+}
+
+static void shell_copy(char *dst, size_t cap, const char *src) {
+    size_t n;
+    if (!dst || cap == 0) {
+        return;
+    }
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    n = strlen(src);
+    if (n >= cap) {
+        n = cap - 1;
+    }
+    if (n > 0) {
+        memcpy(dst, src, n);
+    }
+    dst[n] = '\0';
 }
 
 static bool parse_u32(const char *s, uint32_t *out) {
@@ -583,6 +603,64 @@ static void console_write_fs_error(fs_status_t status) {
     console_putc('\n');
 }
 
+static void console_write_fs_error_path(const char *cmd, const char *path, fs_status_t status) {
+    console_write(cmd);
+    console_write(": ");
+    if (path && path[0] != '\0') {
+        console_write(path);
+        console_write(": ");
+    }
+    console_write(fs_status_string(status));
+    console_putc('\n');
+}
+
+static void sort_entries(fs_entry_t *entries, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        for (size_t j = i + 1; j < count; j++) {
+            if (strcmp(entries[j].name, entries[i].name) < 0) {
+                fs_entry_t tmp = entries[i];
+                entries[i] = entries[j];
+                entries[j] = tmp;
+            }
+        }
+    }
+}
+
+static void print_ls_entry(const fs_entry_t *entry, bool long_format) {
+    if (long_format) {
+        console_write(entry->is_dir ? "d " : "- ");
+        console_write_dec((uint64_t)entry->size);
+        console_write(" ");
+    }
+    console_write(entry->name);
+    if (entry->is_dir) {
+        console_putc('/');
+    }
+    if (!long_format && !entry->is_dir) {
+        console_write(" (");
+        console_write_dec((uint64_t)entry->size);
+        console_write("B)");
+    }
+    console_putc('\n');
+}
+
+static void print_ls_dot_entries(bool long_format) {
+    fs_entry_t dot;
+    fs_entry_t dotdot;
+
+    memset(&dot, 0, sizeof(dot));
+    memset(&dotdot, 0, sizeof(dotdot));
+
+    shell_copy(dot.name, sizeof(dot.name), ".");
+    dot.is_dir = true;
+
+    shell_copy(dotdot.name, sizeof(dotdot.name), "..");
+    dotdot.is_dir = true;
+
+    print_ls_entry(&dot, long_format);
+    print_ls_entry(&dotdot, long_format);
+}
+
 static void cmd_pwd(void) {
     char path[256];
     fs_status_t st = fs_pwd(path, sizeof(path));
@@ -596,56 +674,187 @@ static void cmd_pwd(void) {
 
 static void cmd_ls(char *args) {
     char *cursor = skip_spaces(args);
-    char *path = next_token(&cursor);
+    char *token;
+    const char *path = 0;
+    bool show_all = false;
+    bool long_format = false;
     fs_entry_t entries[64];
+    fs_entry_t stat_entry;
     size_t count = 0;
-    fs_status_t st = fs_list(path, entries, sizeof(entries) / sizeof(entries[0]), &count);
+    fs_status_t st;
 
-    if (st != FS_OK && st != FS_ERR_NO_SPACE) {
-        console_write_fs_error(st);
+    while ((token = next_token(&cursor)) != 0) {
+        if (token[0] == '-') {
+            const char *opt = token + 1;
+            if (strcmp(token, "--") == 0) {
+                token = next_token(&cursor);
+                if (!token) {
+                    break;
+                }
+                if (path != 0) {
+                    console_write("ls: too many paths\n");
+                    return;
+                }
+                path = token;
+                continue;
+            }
+            if (strcmp(token, "--help") == 0) {
+                console_write("Usage: ls [-a] [-l] [path]\n");
+                return;
+            }
+            if (*opt == '\0') {
+                console_write("ls: invalid option '-'\n");
+                return;
+            }
+            while (*opt != '\0') {
+                if (*opt == 'a') {
+                    show_all = true;
+                } else if (*opt == 'l') {
+                    long_format = true;
+                } else {
+                    console_write("ls: invalid option -");
+                    console_putc(*opt);
+                    console_putc('\n');
+                    return;
+                }
+                opt++;
+            }
+            continue;
+        }
+
+        if (path != 0) {
+            console_write("ls: too many paths\n");
+            return;
+        }
+        path = token;
+    }
+
+    st = fs_list(path, entries, sizeof(entries) / sizeof(entries[0]), &count);
+    if (st == FS_ERR_NOT_DIR && path != 0) {
+        st = fs_stat(path, &stat_entry);
+        if (st != FS_OK) {
+            console_write_fs_error_path("ls", path, st);
+            return;
+        }
+        print_ls_entry(&stat_entry, long_format);
         return;
     }
 
+    if (st != FS_OK && st != FS_ERR_NO_SPACE) {
+        console_write_fs_error_path("ls", path ? path : ".", st);
+        return;
+    }
+
+    sort_entries(entries, count < (sizeof(entries) / sizeof(entries[0])) ? count : (sizeof(entries) / sizeof(entries[0])));
+    if (show_all) {
+        print_ls_dot_entries(long_format);
+    }
     for (size_t i = 0; i < count && i < (sizeof(entries) / sizeof(entries[0])); i++) {
-        console_write(entries[i].name);
-        if (entries[i].is_dir) {
-            console_putc('/');
-        } else {
-            console_write(" (");
-            console_write_dec((uint64_t)entries[i].size);
-            console_write("B)");
+        if (!show_all && entries[i].name[0] == '.') {
+            continue;
         }
-        console_putc('\n');
+        print_ls_entry(&entries[i], long_format);
     }
 }
 
 static void cmd_cd(char *args) {
     char *cursor = skip_spaces(args);
     char *path = next_token(&cursor);
+    char old_path[256];
+    char new_path[256];
     fs_status_t st;
+    bool print_new_path = false;
 
     if (!path) {
-        path = "/";
+        path = "/home";
+    } else if (strcmp(path, "~") == 0) {
+        path = "/home";
+    } else if (strcmp(path, "-") == 0) {
+        path = shell_prev_dir;
+        print_new_path = true;
     }
-    st = fs_chdir(path);
+
+    if (next_token(&cursor) != 0) {
+        console_write("cd: too many arguments\n");
+        return;
+    }
+
+    st = fs_pwd(old_path, sizeof(old_path));
     if (st != FS_OK) {
         console_write_fs_error(st);
+        return;
+    }
+
+    st = fs_chdir(path);
+    if (st != FS_OK) {
+        console_write_fs_error_path("cd", path, st);
+        return;
+    }
+
+    if (fs_pwd(new_path, sizeof(new_path)) == FS_OK) {
+        shell_copy(shell_prev_dir, sizeof(shell_prev_dir), old_path);
+        if (print_new_path) {
+            console_write(new_path);
+            console_putc('\n');
+        }
     }
 }
 
 static void cmd_mkdir(char *args) {
     char *cursor = skip_spaces(args);
-    char *path = next_token(&cursor);
-    fs_status_t st;
+    char *token;
+    bool parents = false;
+    bool any_path = false;
+    bool ok = true;
 
-    if (!path) {
+    while ((token = next_token(&cursor)) != 0) {
+        fs_status_t st;
+
+        if (token[0] == '-') {
+            const char *opt = token + 1;
+            if (strcmp(token, "--") == 0) {
+                token = next_token(&cursor);
+                if (!token) {
+                    break;
+                }
+            } else if (strcmp(token, "--help") == 0) {
+                console_write("Usage: mkdir [-p] <path> [path...]\n");
+                return;
+            } else {
+                if (*opt == '\0') {
+                    console_write("mkdir: invalid option '-'\n");
+                    return;
+                }
+                while (*opt != '\0') {
+                    if (*opt == 'p') {
+                        parents = true;
+                    } else {
+                        console_write("mkdir: invalid option -");
+                        console_putc(*opt);
+                        console_putc('\n');
+                        return;
+                    }
+                    opt++;
+                }
+                continue;
+            }
+        }
+
+        any_path = true;
+        st = parents ? fs_mkdir_p(token) : fs_mkdir(token);
+        if (st != FS_OK) {
+            console_write_fs_error_path("mkdir", token, st);
+            ok = false;
+        }
+    }
+
+    if (!any_path) {
         console_write("mkdir: missing path\n");
         return;
     }
 
-    st = fs_mkdir(path);
-    if (st != FS_OK) {
-        console_write_fs_error(st);
+    if (!ok) {
+        return;
     }
 }
 
@@ -661,7 +870,7 @@ static void cmd_touch(char *args) {
 
     st = fs_touch(path);
     if (st != FS_OK) {
-        console_write_fs_error(st);
+        console_write_fs_error_path("touch", path, st);
     }
 }
 
@@ -679,7 +888,7 @@ static void cmd_cat(char *args) {
 
     st = fs_read(path, buf, sizeof(buf), &len);
     if (st != FS_OK) {
-        console_write_fs_error(st);
+        console_write_fs_error_path("cat", path, st);
         return;
     }
 
@@ -703,7 +912,7 @@ static void cmd_write(char *args, bool append) {
     text = skip_spaces(cursor);
     st = fs_write(path, text, append);
     if (st != FS_OK) {
-        console_write_fs_error(st);
+        console_write_fs_error_path(append ? "append" : "write", path, st);
         return;
     }
 
@@ -715,9 +924,9 @@ static void cmd_help(void) {
     console_write("  help              - show this help\n");
     console_write("  clear             - clear the screen\n");
     console_write("  pwd               - print current directory\n");
-    console_write("  ls [path]         - list directory entries\n");
-    console_write("  cd [path]         - change directory (default /)\n");
-    console_write("  mkdir <path>      - create directory\n");
+    console_write("  ls [-a] [-l] [p]  - list files/dirs\n");
+    console_write("  cd [path]         - change directory (~=/home, -=previous)\n");
+    console_write("  mkdir [-p] <p...> - create directory/directories\n");
     console_write("  touch <path>      - create empty file\n");
     console_write("  cat <path>        - print file contents\n");
     console_write("  write <p> <text>  - overwrite file with text\n");
@@ -1041,6 +1250,9 @@ static void cmd_selftest(void) {
 }
 
 static void execute_command(char *line) {
+    char *cursor;
+    char *cmd;
+
     line = skip_spaces(line);
 
     if (*line == '\0') {
@@ -1049,169 +1261,127 @@ static void execute_command(char *line) {
 
     rust_history_push((const uint8_t *)line, strlen(line));
 
-    if (strcmp(line, "help") == 0) {
+    cursor = line;
+    cmd = next_token(&cursor);
+    if (!cmd) {
+        return;
+    }
+    cursor = skip_spaces(cursor);
+
+    if (strcmp(cmd, "help") == 0) {
         cmd_help();
         return;
     }
 
-    if (strcmp(line, "clear") == 0) {
+    if (strcmp(cmd, "clear") == 0) {
         console_clear();
         return;
     }
 
-    if (strcmp(line, "pwd") == 0) {
+    if (strcmp(cmd, "pwd") == 0) {
         cmd_pwd();
         return;
     }
 
-    if (strcmp(line, "ls") == 0) {
-        cmd_ls(line + strlen(line));
+    if (strcmp(cmd, "ls") == 0) {
+        cmd_ls(cursor);
         return;
     }
 
-    if (strncmp(line, "ls ", 3) == 0) {
-        cmd_ls(line + 3);
+    if (strcmp(cmd, "cd") == 0) {
+        cmd_cd(cursor);
         return;
     }
 
-    if (strcmp(line, "cd") == 0) {
-        cmd_cd(line + strlen(line));
+    if (strcmp(cmd, "mkdir") == 0) {
+        cmd_mkdir(cursor);
         return;
     }
 
-    if (strncmp(line, "cd ", 3) == 0) {
-        cmd_cd(line + 3);
+    if (strcmp(cmd, "touch") == 0) {
+        cmd_touch(cursor);
         return;
     }
 
-    if (strncmp(line, "mkdir ", 6) == 0) {
-        cmd_mkdir(line + 6);
+    if (strcmp(cmd, "cat") == 0) {
+        cmd_cat(cursor);
         return;
     }
 
-    if (strcmp(line, "mkdir") == 0) {
-        cmd_mkdir(line + strlen(line));
+    if (strcmp(cmd, "write") == 0) {
+        cmd_write(cursor, false);
         return;
     }
 
-    if (strncmp(line, "touch ", 6) == 0) {
-        cmd_touch(line + 6);
+    if (strcmp(cmd, "append") == 0) {
+        cmd_write(cursor, true);
         return;
     }
 
-    if (strcmp(line, "touch") == 0) {
-        cmd_touch(line + strlen(line));
-        return;
-    }
-
-    if (strncmp(line, "cat ", 4) == 0) {
-        cmd_cat(line + 4);
-        return;
-    }
-
-    if (strcmp(line, "cat") == 0) {
-        cmd_cat(line + strlen(line));
-        return;
-    }
-
-    if (strncmp(line, "write ", 6) == 0) {
-        cmd_write(line + 6, false);
-        return;
-    }
-
-    if (strcmp(line, "write") == 0) {
-        cmd_write(line + strlen(line), false);
-        return;
-    }
-
-    if (strncmp(line, "append ", 7) == 0) {
-        cmd_write(line + 7, true);
-        return;
-    }
-
-    if (strcmp(line, "append") == 0) {
-        cmd_write(line + strlen(line), true);
-        return;
-    }
-
-    if (strcmp(line, "meminfo") == 0) {
+    if (strcmp(cmd, "meminfo") == 0) {
         cmd_meminfo();
         return;
     }
 
-    if (strcmp(line, "kbdinfo") == 0) {
+    if (strcmp(cmd, "kbdinfo") == 0) {
         cmd_kbdinfo();
         return;
     }
 
-    if (strcmp(line, "ansi") == 0) {
+    if (strcmp(cmd, "ansi") == 0) {
         cmd_ansi();
         return;
     }
 
-    if (strcmp(line, "ttyinfo") == 0) {
+    if (strcmp(cmd, "ttyinfo") == 0) {
         cmd_ttyinfo();
         return;
     }
 
-    if (strcmp(line, "health") == 0) {
+    if (strcmp(cmd, "health") == 0) {
         cmd_health();
         return;
     }
 
-    if (strcmp(line, "session") == 0) {
+    if (strcmp(cmd, "session") == 0) {
         cmd_session();
         return;
     }
 
-    if (strcmp(line, "selftest") == 0) {
+    if (strcmp(cmd, "selftest") == 0) {
         cmd_selftest();
         return;
     }
 
-    if (strcmp(line, "kbdctl") == 0) {
-        cmd_kbdctl(line + strlen(line));
+    if (strcmp(cmd, "kbdctl") == 0) {
+        cmd_kbdctl(cursor);
         return;
     }
 
-    if (strncmp(line, "kbdctl ", 7) == 0) {
-        cmd_kbdctl(line + 7);
+    if (strcmp(cmd, "showkey") == 0) {
+        cmd_showkey(cursor);
         return;
     }
 
-    if (strcmp(line, "showkey") == 0) {
-        cmd_showkey(line + strlen(line));
+    if (strcmp(cmd, "storaged") == 0) {
+        cmd_storaged(cursor);
         return;
     }
 
-    if (strncmp(line, "showkey ", 8) == 0) {
-        cmd_showkey(line + 8);
-        return;
-    }
-
-    if (strcmp(line, "storaged") == 0) {
-        cmd_storaged(line + strlen(line));
-        return;
-    }
-
-    if (strncmp(line, "storaged ", 9) == 0) {
-        cmd_storaged(line + 9);
-        return;
-    }
-
-    if (strcmp(line, "echo") == 0) {
-        console_putc('\n');
-        return;
-    }
-
-    if (strncmp(line, "echo ", 5) == 0) {
-        console_write(line + 5);
+    if (strcmp(cmd, "echo") == 0) {
+        if (*cursor != '\0') {
+            console_write(cursor);
+        }
         console_putc('\n');
         return;
     }
 
     console_write("Unknown command: ");
-    console_write(line);
+    console_write(cmd);
+    if (*cursor != '\0') {
+        console_putc(' ');
+        console_write(cursor);
+    }
     console_putc('\n');
 }
 
@@ -1257,6 +1427,7 @@ void shell_init(void) {
     showkey_head = 0;
     showkey_count = 0;
     showkey_live = false;
+    shell_copy(shell_prev_dir, sizeof(shell_prev_dir), "/");
     tty_set_canonical(true);
     tty_set_echo(true);
     shell_prompt();

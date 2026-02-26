@@ -193,18 +193,14 @@ static int fs_alloc_node(void) {
     return -1;
 }
 
-static fs_status_t fs_create_node(const char *path, bool is_dir, int *out_idx) {
-    int parent;
+static fs_status_t fs_create_child(int parent, const char *name, bool is_dir, int *out_idx) {
     int idx;
-    char name[FS_MAX_NAME + 1];
-    fs_status_t st;
 
-    st = fs_resolve_parent(path, &parent, name, sizeof(name));
-    if (st != FS_OK) {
-        return st;
-    }
     if (!g_nodes[parent].is_dir) {
         return FS_ERR_NOT_DIR;
+    }
+    if (!name || name[0] == '\0') {
+        return FS_ERR_INVALID;
     }
     if (fs_find_child(parent, name) >= 0) {
         return FS_ERR_EXISTS;
@@ -227,6 +223,19 @@ static fs_status_t fs_create_node(const char *path, bool is_dir, int *out_idx) {
         *out_idx = idx;
     }
     return FS_OK;
+}
+
+static fs_status_t fs_create_node(const char *path, bool is_dir, int *out_idx) {
+    int parent;
+    char name[FS_MAX_NAME + 1];
+    fs_status_t st;
+
+    st = fs_resolve_parent(path, &parent, name, sizeof(name));
+    if (st != FS_OK) {
+        return st;
+    }
+
+    return fs_create_child(parent, name, is_dir, out_idx);
 }
 
 static void fs_seed_dirs(void) {
@@ -312,6 +321,61 @@ fs_status_t fs_chdir(const char *path) {
 
 fs_status_t fs_mkdir(const char *path) {
     return fs_create_node(path, true, 0);
+}
+
+fs_status_t fs_mkdir_p(const char *path) {
+    char comp[FS_MAX_NAME + 1];
+    size_t i = 0;
+    int cur;
+    fs_status_t st;
+
+    if (!path || path[0] == '\0') {
+        return FS_ERR_INVALID;
+    }
+
+    cur = (path[0] == '/') ? 0 : g_cwd;
+    if (path[0] == '/') {
+        i = 1;
+    }
+
+    while (1) {
+        int next;
+
+        while (path[i] == '/') {
+            i++;
+        }
+        if (path[i] == '\0') {
+            return FS_OK;
+        }
+
+        st = fs_parse_component(path, &i, comp, sizeof(comp));
+        if (st != FS_OK) {
+            return st;
+        }
+
+        if (fs_name_eq(comp, ".")) {
+            continue;
+        }
+        if (fs_name_eq(comp, "..")) {
+            cur = g_nodes[cur].parent;
+            continue;
+        }
+
+        next = fs_find_child(cur, comp);
+        if (next >= 0) {
+            if (!g_nodes[next].is_dir) {
+                return FS_ERR_NOT_DIR;
+            }
+            cur = next;
+            continue;
+        }
+
+        st = fs_create_child(cur, comp, true, &next);
+        if (st != FS_OK) {
+            return st;
+        }
+        cur = next;
+    }
 }
 
 fs_status_t fs_touch(const char *path) {
@@ -442,6 +506,26 @@ fs_status_t fs_list(const char *path, fs_entry_t *entries, size_t max_entries, s
     if (entries && count > max_entries) {
         return FS_ERR_NO_SPACE;
     }
+    return FS_OK;
+}
+
+fs_status_t fs_stat(const char *path, fs_entry_t *out) {
+    int idx;
+    fs_status_t st;
+
+    if (!out) {
+        return FS_ERR_INVALID;
+    }
+
+    st = fs_resolve(path, &idx);
+    if (st != FS_OK) {
+        return st;
+    }
+
+    memset(out, 0, sizeof(*out));
+    fs_copy(out->name, sizeof(out->name), g_nodes[idx].name);
+    out->is_dir = g_nodes[idx].is_dir;
+    out->size = g_nodes[idx].size;
     return FS_OK;
 }
 

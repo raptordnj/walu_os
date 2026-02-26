@@ -21,6 +21,7 @@ WaluOS is a minimal hobby OS kernel for x86_64.
 - PTY channel skeleton (master/slave ring buffers)
 - Subsystem fault counters for keyboard/TTY/PTY overflow and invalid operations
 - Tiny shell commands: `help`, `clear`, `pwd`, `ls`, `cd`, `mkdir`, `touch`, `cat`, `write`, `append`, `meminfo`, `kbdinfo`, `kbdctl`, `showkey`, `storaged`, `ttyinfo`, `health`, `ansi`, `echo`
+- Shell file UX polish: `ls -a/-l`, `mkdir -p`, `cd ~`, `cd -`, and clearer path-aware errors
 - Shell control input support (`Ctrl-C`, `Ctrl-L`) via TTY pipeline
 - Rust `#![no_std]` static library linked into the C kernel
 - Architecture blueprint and implementation roadmap in `docs/`

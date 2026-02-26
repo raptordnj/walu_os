@@ -6,6 +6,7 @@
 int main(void) {
     char buf[256];
     fs_entry_t entries[32];
+    fs_entry_t entry;
     size_t count = 0;
     size_t len = 0;
     fs_status_t st;
@@ -20,6 +21,15 @@ int main(void) {
     assert(st == FS_OK);
     st = fs_mkdir("/docs");
     assert(st == FS_ERR_EXISTS);
+
+    st = fs_mkdir_p("/var/log/walu");
+    assert(st == FS_OK);
+    st = fs_mkdir_p("/var/log/walu");
+    assert(st == FS_OK);
+
+    st = fs_stat("/var/log", &entry);
+    assert(st == FS_OK);
+    assert(entry.is_dir);
 
     st = fs_touch("/docs/readme.txt");
     assert(st == FS_OK);
@@ -41,6 +51,14 @@ int main(void) {
 
     st = fs_touch("notes.txt");
     assert(st == FS_OK);
+
+    st = fs_mkdir_p("../tmp/cache");
+    assert(st == FS_OK);
+
+    st = fs_touch("/var/log/walu/events.log");
+    assert(st == FS_OK);
+    st = fs_mkdir_p("/var/log/walu/events.log/archive");
+    assert(st == FS_ERR_NOT_DIR);
 
     st = fs_list(".", entries, sizeof(entries) / sizeof(entries[0]), &count);
     assert(st == FS_OK);
