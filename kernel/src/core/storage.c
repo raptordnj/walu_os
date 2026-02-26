@@ -1,3 +1,4 @@
+#include <kernel/fs.h>
 #include <kernel/storage.h>
 #include <kernel/string.h>
 
@@ -74,6 +75,155 @@ static bool storage_is_valid_device_path(const char *path) {
 static bool storage_is_supported_fstype(const char *fstype) {
     return fstype &&
            (strcmp(fstype, "ext4") == 0 || strcmp(fstype, "vfat") == 0 || strcmp(fstype, "xfs") == 0);
+}
+
+static bool storage_join_path(char *out, size_t cap, const char *base, const char *rel) {
+    size_t base_len;
+    size_t rel_len;
+    size_t pos = 0;
+
+    if (!out || cap == 0 || !storage_is_absolute_path(base) || !rel || rel[0] != '/') {
+        return false;
+    }
+
+    base_len = storage_strnlen_local(base, cap);
+    rel_len = storage_strnlen_local(rel, cap);
+    if (base_len == 0 || rel_len == 0) {
+        return false;
+    }
+
+    if (base_len == 1 && base[0] == '/') {
+        if (rel_len + 1 > cap) {
+            return false;
+        }
+        storage_copy(out, cap, rel);
+        return true;
+    }
+
+    if (base_len + rel_len + 1 > cap) {
+        return false;
+    }
+
+    memcpy(out + pos, base, base_len);
+    pos += base_len;
+    memcpy(out + pos, rel, rel_len);
+    pos += rel_len;
+    out[pos] = '\0';
+    return true;
+}
+
+static storage_status_t storage_map_fs_status(fs_status_t st) {
+    if (st == FS_OK) {
+        return STORAGE_OK;
+    }
+    if (st == FS_ERR_NO_SPACE) {
+        return STORAGE_ERR_BUSY;
+    }
+    return STORAGE_ERR_FS;
+}
+
+static storage_status_t storage_seed_dir(const char *target, const char *rel) {
+    char path[128];
+    fs_status_t st;
+
+    if (!storage_join_path(path, sizeof(path), target, rel)) {
+        return STORAGE_ERR_INVALID;
+    }
+    st = fs_mkdir_p(path);
+    return storage_map_fs_status(st);
+}
+
+static storage_status_t storage_seed_file(const char *target, const char *rel, const char *content) {
+    char path[128];
+    fs_status_t st;
+
+    if (!storage_join_path(path, sizeof(path), target, rel)) {
+        return STORAGE_ERR_INVALID;
+    }
+    st = fs_write(path, content, false);
+    return storage_map_fs_status(st);
+}
+
+static storage_status_t storage_seed_unix_layout(const char *target) {
+    static const char *dirs[] = {
+        "/bin", "/sbin",
+        "/usr", "/usr/bin", "/usr/sbin",
+        "/etc", "/etc/skel",
+        "/var", "/var/log", "/var/tmp",
+        "/home", "/home/walu", "/root",
+        "/tmp", "/dev", "/proc", "/sys", "/run", "/boot", "/media"
+    };
+    storage_status_t status;
+
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        status = storage_seed_dir(target, dirs[i]);
+        if (status != STORAGE_OK) {
+            return status;
+        }
+    }
+
+    status = storage_seed_file(target, "/etc/passwd",
+                               "root:x:0:0:root:/root:/bin/sh\n"
+                               "walu:x:1000:1000:Walu User:/home/walu:/bin/sh\n");
+    if (status != STORAGE_OK) {
+        return status;
+    }
+    status = storage_seed_file(target, "/etc/group",
+                               "root:x:0:\n"
+                               "walu:x:1000:walu\n"
+                               "wheel:x:10:walu\n");
+    if (status != STORAGE_OK) {
+        return status;
+    }
+    status = storage_seed_file(target, "/etc/shadow",
+                               "root:!:19000:0:99999:7:::\n"
+                               "walu:!:19000:0:99999:7:::\n");
+    if (status != STORAGE_OK) {
+        return status;
+    }
+    status = storage_seed_file(target, "/etc/hostname", "waluos\n");
+    if (status != STORAGE_OK) {
+        return status;
+    }
+    status = storage_seed_file(target, "/etc/os-release",
+                               "NAME=\"WaluOS\"\n"
+                               "ID=waluos\n"
+                               "PRETTY_NAME=\"WaluOS\"\n");
+    if (status != STORAGE_OK) {
+        return status;
+    }
+    status = storage_seed_file(target, "/etc/fstab",
+                               "/dev/root / ext4 defaults 0 1\n"
+                               "proc /proc proc defaults 0 0\n"
+                               "sysfs /sys sysfs defaults 0 0\n");
+    if (status != STORAGE_OK) {
+        return status;
+    }
+    status = storage_seed_file(target, "/etc/profile",
+                               "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n"
+                               "export HOME=/home/walu\n");
+    if (status != STORAGE_OK) {
+        return status;
+    }
+    status = storage_seed_file(target, "/etc/motd",
+                               "Welcome to WaluOS\n"
+                               "A dreaming OS from Bangladesh.\n");
+    if (status != STORAGE_OK) {
+        return status;
+    }
+    status = storage_seed_file(target, "/home/walu/.profile",
+                               "export PATH=/bin:/usr/bin\n"
+                               "cd /home/walu\n");
+    if (status != STORAGE_OK) {
+        return status;
+    }
+    status = storage_seed_file(target, "/var/log/install.log",
+                               "storaged install: unix-like base system prepared\n");
+    if (status != STORAGE_OK) {
+        return status;
+    }
+
+    return STORAGE_OK;
 }
 
 static char hex_digit(uint8_t value) {
@@ -382,6 +532,53 @@ storage_status_t storage_format(const char *device, const char *fstype, const ch
     return STORAGE_OK;
 }
 
+storage_status_t storage_install(const char *device, const char *target,
+                                 bool force, bool dry_run, bool confirmed) {
+    int slot;
+    storage_device_t *d;
+    storage_status_t st;
+
+    if (!storage_is_valid_device_path(device) || !storage_is_absolute_path(target)) {
+        return STORAGE_ERR_INVALID;
+    }
+
+    slot = storage_find_device_slot(device);
+    if (slot < 0) {
+        return STORAGE_ERR_NOT_FOUND;
+    }
+
+    d = &g_devices[slot];
+    if (!d->formatted) {
+        return STORAGE_ERR_NO_FILESYSTEM;
+    }
+    if (d->read_only) {
+        return STORAGE_ERR_POLICY;
+    }
+    if (!force || !confirmed) {
+        return STORAGE_ERR_CONFIRMATION_REQUIRED;
+    }
+
+    if (d->mount_slot >= 0) {
+        if (strcmp(g_mounts[d->mount_slot].target, target) != 0) {
+            return STORAGE_ERR_BUSY;
+        }
+        if (!g_mounts[d->mount_slot].read_write) {
+            return STORAGE_ERR_POLICY;
+        }
+    } else {
+        st = storage_mount(device, target, true, true, true, dry_run);
+        if (st != STORAGE_OK) {
+            return st;
+        }
+    }
+
+    if (dry_run) {
+        return STORAGE_OK;
+    }
+
+    return storage_seed_unix_layout(target);
+}
+
 const char *storage_status_string(storage_status_t status) {
     switch (status) {
         case STORAGE_OK: return "ok";
@@ -393,6 +590,7 @@ const char *storage_status_string(storage_status_t status) {
         case STORAGE_ERR_POLICY: return "policy-denied";
         case STORAGE_ERR_CONFIRMATION_REQUIRED: return "confirmation-required";
         case STORAGE_ERR_NO_FILESYSTEM: return "no-filesystem";
+        case STORAGE_ERR_FS: return "filesystem-error";
         default: return "unknown";
     }
 }

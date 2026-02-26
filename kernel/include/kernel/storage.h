@@ -15,6 +15,7 @@ typedef enum {
     STORAGE_ERR_POLICY,
     STORAGE_ERR_CONFIRMATION_REQUIRED,
     STORAGE_ERR_NO_FILESYSTEM,
+    STORAGE_ERR_FS,
 } storage_status_t;
 
 typedef struct {
@@ -42,6 +43,8 @@ storage_status_t storage_umount_target(const char *target, bool dry_run);
 storage_status_t storage_fsck(const char *device, bool force, bool dry_run, bool confirmed);
 storage_status_t storage_format(const char *device, const char *fstype, const char *label,
                                 bool force, bool dry_run, bool confirmed);
+storage_status_t storage_install(const char *device, const char *target,
+                                 bool force, bool dry_run, bool confirmed);
 
 const char *storage_status_string(storage_status_t status);
 

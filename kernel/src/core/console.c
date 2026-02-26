@@ -59,6 +59,7 @@ static volatile uint32_t *fb_memory = 0;
 static uint32_t fb_width = 0;
 static uint32_t fb_height = 0;
 static uint32_t fb_pitch_pixels = 0;
+static uint8_t fb_font_scale = 1;
 
 static char fb_cells[FB_MAX_ROWS][FB_MAX_COLS];
 static uint8_t fb_cell_colors[FB_MAX_ROWS][FB_MAX_COLS];
@@ -134,9 +135,19 @@ static void fb_plot(uint32_t x, uint32_t y, uint32_t rgb) {
     fb_memory[y * fb_pitch_pixels + x] = rgb;
 }
 
+static uint32_t fb_cell_width(void) {
+    return (uint32_t)GLYPH_WIDTH * (uint32_t)fb_font_scale;
+}
+
+static uint32_t fb_cell_height(void) {
+    return (uint32_t)GLYPH_HEIGHT * (uint32_t)fb_font_scale;
+}
+
 static void fb_draw_cell(size_t row, size_t col, char c, uint8_t color) {
     uint32_t x0;
     uint32_t y0;
+    uint32_t cell_w;
+    uint32_t cell_h;
     uint32_t fg;
     uint32_t bg;
     uint8_t glyph_index;
@@ -145,10 +156,12 @@ static void fb_draw_cell(size_t row, size_t col, char c, uint8_t color) {
         return;
     }
 
-    x0 = (uint32_t)(col * GLYPH_WIDTH);
-    y0 = (uint32_t)(row * GLYPH_HEIGHT);
+    cell_w = fb_cell_width();
+    cell_h = fb_cell_height();
+    x0 = (uint32_t)(col * cell_w);
+    y0 = (uint32_t)(row * cell_h);
 
-    if (x0 + GLYPH_WIDTH > fb_width || y0 + GLYPH_HEIGHT > fb_height) {
+    if (x0 + cell_w > fb_width || y0 + cell_h > fb_height) {
         return;
     }
 
@@ -160,10 +173,10 @@ static void fb_draw_cell(size_t row, size_t col, char c, uint8_t color) {
         glyph_index = (uint8_t)'?';
     }
 
-    for (uint32_t gy = 0; gy < GLYPH_HEIGHT; gy++) {
-        uint8_t row_bits = font8x8_basic[glyph_index][gy >> 1];
-        for (uint32_t gx = 0; gx < GLYPH_WIDTH; gx++) {
-            bool on = (row_bits & (1u << gx)) != 0;
+    for (uint32_t gy = 0; gy < cell_h; gy++) {
+        uint8_t row_bits = font8x8_basic[glyph_index][(gy / fb_font_scale) >> 1];
+        for (uint32_t gx = 0; gx < cell_w; gx++) {
+            bool on = (row_bits & (1u << (gx / fb_font_scale))) != 0;
             fb_plot(x0 + gx, y0 + gy, on ? fg : bg);
         }
     }
@@ -606,6 +619,33 @@ void console_init(void) {
     console_clear();
 }
 
+static bool console_recalc_fb_grid(void) {
+    uint32_t cell_w;
+    uint32_t cell_h;
+
+    if (!fb_memory) {
+        return false;
+    }
+
+    cell_w = fb_cell_width();
+    cell_h = fb_cell_height();
+    if (cell_w == 0 || cell_h == 0) {
+        return false;
+    }
+
+    term_cols = fb_width / cell_w;
+    term_rows = fb_height / cell_h;
+
+    if (term_cols > FB_MAX_COLS) {
+        term_cols = FB_MAX_COLS;
+    }
+    if (term_rows > FB_MAX_ROWS) {
+        term_rows = FB_MAX_ROWS;
+    }
+
+    return term_cols != 0 && term_rows != 0;
+}
+
 bool console_enable_framebuffer(void) {
     const video_framebuffer_info_t *fb = video_framebuffer_info();
 
@@ -620,23 +660,52 @@ bool console_enable_framebuffer(void) {
     fb_height = fb->height;
     fb_pitch_pixels = fb->pitch / 4;
 
-    term_cols = fb_width / GLYPH_WIDTH;
-    term_rows = fb_height / GLYPH_HEIGHT;
-
-    if (term_cols > FB_MAX_COLS) {
-        term_cols = FB_MAX_COLS;
-    }
-    if (term_rows > FB_MAX_ROWS) {
-        term_rows = FB_MAX_ROWS;
-    }
-
-    if (term_cols == 0 || term_rows == 0) {
-        return false;
+    fb_font_scale = 2;
+    if (!console_recalc_fb_grid() || term_cols < 40 || term_rows < 14) {
+        fb_font_scale = 1;
+        if (!console_recalc_fb_grid()) {
+            return false;
+        }
     }
 
     g_backend = CONSOLE_BACKEND_FB;
     console_clear();
     return true;
+}
+
+bool console_set_font_scale(uint8_t scale) {
+    if (scale < 1 || scale > 2) {
+        return false;
+    }
+    if (g_backend != CONSOLE_BACKEND_FB || !fb_memory) {
+        return false;
+    }
+
+    fb_font_scale = scale;
+    if (!console_recalc_fb_grid() || term_cols < 20 || term_rows < 8) {
+        fb_font_scale = 1;
+        (void)console_recalc_fb_grid();
+        return false;
+    }
+
+    console_clear();
+    return true;
+}
+
+uint8_t console_font_scale(void) {
+    return fb_font_scale;
+}
+
+bool console_framebuffer_enabled(void) {
+    return g_backend == CONSOLE_BACKEND_FB;
+}
+
+size_t console_columns(void) {
+    return term_cols;
+}
+
+size_t console_rows(void) {
+    return term_rows;
 }
 
 void console_clear(void) {

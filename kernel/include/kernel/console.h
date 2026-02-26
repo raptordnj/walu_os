@@ -2,10 +2,16 @@
 #define WALU_CONSOLE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 void console_init(void);
 bool console_enable_framebuffer(void);
+bool console_set_font_scale(uint8_t scale);
+uint8_t console_font_scale(void);
+bool console_framebuffer_enabled(void);
+size_t console_columns(void);
+size_t console_rows(void);
 void console_clear(void);
 void console_putc(char c);
 void console_backspace(void);

@@ -25,7 +25,7 @@ gcc -std=gnu11 -Wall -Wextra -O2 -fno-builtin -Ikernel/include \
 "$KBD_OUT_BIN"
 
 gcc -std=gnu11 -Wall -Wextra -O2 -fno-builtin -Ikernel/include \
-  kernel/tests/test_storage.c kernel/src/core/storage.c kernel/src/lib/string.c \
+  kernel/tests/test_storage.c kernel/src/core/storage.c kernel/src/core/fs.c kernel/src/lib/string.c \
   -o "$STORAGE_OUT_BIN"
 
 "$STORAGE_OUT_BIN"

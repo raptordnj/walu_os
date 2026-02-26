@@ -1,7 +1,9 @@
 #include <kernel/console.h>
 #include <kernel/editor.h>
 #include <kernel/fs.h>
+#include <kernel/io.h>
 #include <kernel/keyboard.h>
+#include <kernel/machine.h>
 #include <kernel/pit.h>
 #include <kernel/pmm.h>
 #include <kernel/pty.h>
@@ -40,8 +42,29 @@ typedef struct {
     bool json;
 } storaged_args_t;
 
+static const char *shell_commands[] = {
+    "help", "clear", "pwd", "ls", "cd", "mkdir", "touch", "cat", "write", "append", "nano",
+    "reboot", "reset", "poweroff", "shutdown", "ui",
+    "meminfo", "kbdinfo", "kbdctl", "showkey", "ttyinfo", "session", "health", "selftest",
+    "ansi", "echo", "storaged", "format", "install"
+};
+
 static void shell_prompt(void) {
-    console_write("\x1B[1;32mwalu\x1B[0m> ");
+    char cwd[128];
+    const char *path = "?";
+    if (fs_pwd(cwd, sizeof(cwd)) == FS_OK) {
+        path = cwd;
+    }
+
+    console_write("\x1B[1;36m");
+    console_write("walu");
+    console_write("\x1B[0m");
+    console_write(" ");
+    console_write("\x1B[1;33m");
+    console_write(path);
+    console_write("\x1B[0m");
+    console_write(" ");
+    console_write("\x1B[1;32m$ \x1B[0m");
 }
 
 static void console_write_uplus(uint32_t cp) {
@@ -148,6 +171,45 @@ static bool parse_u32(const char *s, uint32_t *out) {
     return true;
 }
 
+static size_t abs_diff_size(size_t a, size_t b) {
+    return (a > b) ? (a - b) : (b - a);
+}
+
+static size_t common_prefix_len(const char *a, const char *b) {
+    size_t i = 0;
+    while (a[i] != '\0' && b[i] != '\0' && a[i] == b[i]) {
+        i++;
+    }
+    return i;
+}
+
+static const char *suggest_command(const char *cmd) {
+    int best_score = -1000;
+    const char *best = 0;
+    size_t cmd_len;
+
+    if (!cmd || cmd[0] == '\0') {
+        return 0;
+    }
+
+    cmd_len = strlen(cmd);
+    for (size_t i = 0; i < (sizeof(shell_commands) / sizeof(shell_commands[0])); i++) {
+        const char *candidate = shell_commands[i];
+        size_t candidate_len = strlen(candidate);
+        size_t prefix = common_prefix_len(cmd, candidate);
+        int score = (int)(prefix * 5) - (int)abs_diff_size(cmd_len, candidate_len);
+        if (score > best_score) {
+            best_score = score;
+            best = candidate;
+        }
+    }
+
+    if (best_score < 2) {
+        return 0;
+    }
+    return best;
+}
+
 static void showkey_record_event(const key_event_t *ev) {
     showkey_ring[showkey_head] = *ev;
     showkey_head = (showkey_head + 1) % SHOWKEY_RING_SIZE;
@@ -174,11 +236,23 @@ static void showkey_print_event(const key_event_t *ev) {
     console_putc('\n');
 }
 
+static void maybe_handle_system_hotkey(const key_event_t *ev) {
+    if (!ev->pressed) {
+        return;
+    }
+    if (ev->keycode == KEY_DELETE &&
+        ((ev->modifiers & (KBD_MOD_CTRL | KBD_MOD_ALT)) == (KBD_MOD_CTRL | KBD_MOD_ALT))) {
+        console_write("\nCtrl+Alt+Del pressed: rebooting\n");
+        machine_reboot();
+    }
+}
+
 static void collect_keyboard_events(void) {
     key_event_t ev;
 
     while (keyboard_pop_event(&ev)) {
         showkey_record_event(&ev);
+        maybe_handle_system_hotkey(&ev);
         if (showkey_live) {
             showkey_print_event(&ev);
         }
@@ -310,6 +384,534 @@ static bool storaged_confirmed(const storaged_args_t *args) {
            strcmp(args->confirm, args->device) == 0;
 }
 
+static void cmd_storaged_lsblk(const storaged_args_t *args);
+
+static char ascii_tolower(char c) {
+    if (c >= 'A' && c <= 'Z') {
+        return (char)(c + ('a' - 'A'));
+    }
+    return c;
+}
+
+static bool str_equals_ci(const char *a, const char *b) {
+    size_t i = 0;
+    if (!a || !b) {
+        return false;
+    }
+    while (a[i] != '\0' && b[i] != '\0') {
+        if (ascii_tolower(a[i]) != ascii_tolower(b[i])) {
+            return false;
+        }
+        i++;
+    }
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+static void trim_right_spaces(char *s) {
+    size_t n;
+    if (!s) {
+        return;
+    }
+    n = strlen(s);
+    while (n > 0) {
+        char c = s[n - 1];
+        if (c == ' ' || c == '\t' || c == '\r') {
+            s[n - 1] = '\0';
+            n--;
+            continue;
+        }
+        break;
+    }
+}
+
+static bool shell_pop_interactive_char(char *out) {
+    int pty_id;
+    uint8_t byte;
+
+    if (!out) {
+        return false;
+    }
+
+    tty_poll_input();
+    collect_keyboard_events();
+
+    pty_id = session_active_pty();
+    if (pty_id >= 0) {
+        if (pty_slave_read(pty_id, &byte, 1) == 1) {
+            *out = (char)byte;
+            return true;
+        }
+        return false;
+    }
+
+    return tty_pop_char(out);
+}
+
+static bool shell_readline_prompt(const char *prompt, char *out, size_t cap, bool allow_empty) {
+    size_t len = 0;
+    char c;
+
+    if (!out || cap == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    if (prompt && prompt[0] != '\0') {
+        console_write(prompt);
+    }
+
+    while (1) {
+        while (!shell_pop_interactive_char(&c)) {
+            hlt();
+        }
+
+        if (c == 0x03 || c == 0x04) {
+            return false;
+        }
+
+        if (c == '\n') {
+            out[len] = '\0';
+            trim_right_spaces(out);
+            if (!allow_empty && out[0] == '\0') {
+                if (prompt && prompt[0] != '\0') {
+                    console_write(prompt);
+                }
+                continue;
+            }
+            return true;
+        }
+
+        if (((unsigned char)c < 0x20 || c == 0x7F) && c != '\t') {
+            continue;
+        }
+
+        if (len + 1 < cap) {
+            out[len++] = c;
+        }
+    }
+}
+
+static bool shell_prompt_yes_no(const char *prompt, bool default_value, bool *ok) {
+    char line[16];
+
+    if (ok) {
+        *ok = false;
+    }
+    if (!shell_readline_prompt(prompt, line, sizeof(line), true)) {
+        return default_value;
+    }
+    if (ok) {
+        *ok = true;
+    }
+    if (line[0] == '\0') {
+        return default_value;
+    }
+    if (str_equals_ci(line, "y") || str_equals_ci(line, "yes")) {
+        return true;
+    }
+    if (str_equals_ci(line, "n") || str_equals_ci(line, "no")) {
+        return false;
+    }
+    return default_value;
+}
+
+static bool shell_prompt_require_yes(const char *prompt) {
+    char line[16];
+    if (!shell_readline_prompt(prompt, line, sizeof(line), false)) {
+        return false;
+    }
+    return strcmp(line, "YES") == 0;
+}
+
+static const char *shell_default_device_path(void) {
+    static const char *fallback = "/dev/usb0";
+    size_t n = storage_device_count();
+    storage_device_info_t info;
+
+    for (size_t i = 0; i < n; i++) {
+        if (!storage_device_info(i, &info)) {
+            continue;
+        }
+        if (info.read_only) {
+            continue;
+        }
+        if (info.removable) {
+            return info.path;
+        }
+    }
+    return fallback;
+}
+
+static const char *shell_device_name(const char *path) {
+    const char *name = path;
+    size_t i = 0;
+
+    if (!path) {
+        return "";
+    }
+    while (path[i] != '\0') {
+        if (path[i] == '/') {
+            name = &path[i + 1];
+        }
+        i++;
+    }
+    return name;
+}
+
+static void shell_print_device_summary(const char *device) {
+    storage_device_info_t info;
+    if (storage_find_device(device, &info) && info.formatted) {
+        console_write(device);
+        console_write(": TYPE=\"");
+        console_write(info.fstype);
+        console_write("\" UUID=\"");
+        console_write(info.uuid);
+        console_write("\"");
+        if (info.label && info.label[0] != '\0') {
+            console_write(" LABEL=\"");
+            console_write(info.label);
+            console_write("\"");
+        }
+        console_putc('\n');
+    }
+}
+
+static void cmd_format_usage(void) {
+    console_write("Usage: format --device <path> [options]\n");
+    console_write("Options:\n");
+    console_write("  --fstype ext4|vfat|xfs   filesystem type (default: ext4)\n");
+    console_write("  --label <name>           filesystem label\n");
+    console_write("  --dry-run                preview without changing device\n");
+    console_write("  --force --confirm <path> --yes   required for destructive run\n");
+    console_write("No args: starts interactive wizard\n");
+}
+
+static void cmd_install_usage(void) {
+    console_write("Usage: install --device <path> --target <dir> [options]\n");
+    console_write("Options:\n");
+    console_write("  --fstype ext4|vfat|xfs   filesystem type (default: ext4)\n");
+    console_write("  --label <name>           filesystem label\n");
+    console_write("  --dry-run                preview without changing device\n");
+    console_write("  --force --confirm <path> --yes   required for destructive run\n");
+    console_write("No args: starts interactive wizard\n");
+}
+
+static bool cmd_format_interactive(storaged_args_t *out) {
+    storaged_args_t empty;
+    const char *default_device = shell_default_device_path();
+    static char line[128];
+    static char fstype[16];
+    static char label[32];
+    char prompt[96];
+    bool dry_run;
+    bool ok = false;
+
+    if (!out) {
+        return false;
+    }
+
+    console_write("Interactive format wizard\n");
+    memset(&empty, 0, sizeof(empty));
+    cmd_storaged_lsblk(&empty);
+
+    shell_copy(line, sizeof(line), default_device);
+    shell_copy(prompt, sizeof(prompt), "Device path [");
+    shell_copy(prompt + strlen(prompt), sizeof(prompt) - strlen(prompt), default_device);
+    shell_copy(prompt + strlen(prompt), sizeof(prompt) - strlen(prompt), "]: ");
+    if (!shell_readline_prompt(prompt, line, sizeof(line), true)) {
+        return false;
+    }
+    if (line[0] == '\0') {
+        shell_copy(line, sizeof(line), default_device);
+    }
+
+    shell_copy(fstype, sizeof(fstype), "ext4");
+    if (!shell_readline_prompt("Filesystem [ext4]: ", fstype, sizeof(fstype), true)) {
+        return false;
+    }
+    if (fstype[0] == '\0') {
+        shell_copy(fstype, sizeof(fstype), "ext4");
+    }
+
+    label[0] = '\0';
+    if (!shell_readline_prompt("Label (optional): ", label, sizeof(label), true)) {
+        return false;
+    }
+
+    dry_run = shell_prompt_yes_no("Dry-run first? [Y/n]: ", true, &ok);
+    if (!ok) {
+        return false;
+    }
+
+    console_write("Summary: format ");
+    console_write(line);
+    console_write(" as ");
+    console_write(fstype);
+    if (label[0] != '\0') {
+        console_write(" label=");
+        console_write(label);
+    }
+    if (dry_run) {
+        console_write(" (dry-run)");
+    }
+    console_putc('\n');
+
+    if (!dry_run) {
+        console_write("This will erase filesystem metadata on ");
+        console_write(line);
+        console_putc('\n');
+        if (!shell_prompt_require_yes("Type YES to continue: ")) {
+            return false;
+        }
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->device = line;
+    out->fstype = fstype;
+    out->label = (label[0] != '\0') ? label : 0;
+    out->dry_run = dry_run;
+    out->force = true;
+    out->yes = true;
+    out->confirm = out->device;
+    return true;
+}
+
+static bool cmd_install_interactive(storaged_args_t *out) {
+    storaged_args_t empty;
+    const char *default_device = shell_default_device_path();
+    static char device[128];
+    static char target[128];
+    static char fstype[16];
+    static char label[32];
+    char prompt[112];
+    bool do_format = true;
+    bool dry_run;
+    bool ok = false;
+
+    if (!out) {
+        return false;
+    }
+
+    console_write("Interactive install wizard\n");
+    memset(&empty, 0, sizeof(empty));
+    cmd_storaged_lsblk(&empty);
+
+    shell_copy(device, sizeof(device), default_device);
+    shell_copy(prompt, sizeof(prompt), "Device path [");
+    shell_copy(prompt + strlen(prompt), sizeof(prompt) - strlen(prompt), default_device);
+    shell_copy(prompt + strlen(prompt), sizeof(prompt) - strlen(prompt), "]: ");
+    if (!shell_readline_prompt(prompt, device, sizeof(device), true)) {
+        return false;
+    }
+    if (device[0] == '\0') {
+        shell_copy(device, sizeof(device), default_device);
+    }
+
+    shell_copy(target, sizeof(target), "/media/");
+    shell_copy(target + strlen(target), sizeof(target) - strlen(target), shell_device_name(device));
+    shell_copy(prompt, sizeof(prompt), "Install target [");
+    shell_copy(prompt + strlen(prompt), sizeof(prompt) - strlen(prompt), target);
+    shell_copy(prompt + strlen(prompt), sizeof(prompt) - strlen(prompt), "]: ");
+    if (!shell_readline_prompt(prompt, target, sizeof(target), true)) {
+        return false;
+    }
+    if (target[0] == '\0') {
+        shell_copy(target, sizeof(target), "/media/");
+        shell_copy(target + strlen(target), sizeof(target) - strlen(target), shell_device_name(device));
+    }
+
+    do_format = shell_prompt_yes_no("Format before install? [Y/n]: ", true, &ok);
+    if (!ok) {
+        return false;
+    }
+
+    shell_copy(fstype, sizeof(fstype), "ext4");
+    if (do_format) {
+        if (!shell_readline_prompt("Filesystem [ext4]: ", fstype, sizeof(fstype), true)) {
+            return false;
+        }
+        if (fstype[0] == '\0') {
+            shell_copy(fstype, sizeof(fstype), "ext4");
+        }
+    }
+
+    label[0] = '\0';
+    if (do_format) {
+        if (!shell_readline_prompt("Label (optional): ", label, sizeof(label), true)) {
+            return false;
+        }
+    }
+
+    dry_run = shell_prompt_yes_no("Dry-run first? [Y/n]: ", true, &ok);
+    if (!ok) {
+        return false;
+    }
+
+    console_write("Summary: install ");
+    console_write(device);
+    console_write(" -> ");
+    console_write(target);
+    if (do_format) {
+        console_write(" (format=");
+        console_write(fstype);
+        if (label[0] != '\0') {
+            console_write(",label=");
+            console_write(label);
+        }
+        console_write(")");
+    } else {
+        console_write(" (no-format)");
+    }
+    if (dry_run) {
+        console_write(" (dry-run)");
+    }
+    console_putc('\n');
+
+    if (!dry_run) {
+        console_write("This may overwrite data on ");
+        console_write(device);
+        console_putc('\n');
+        if (!shell_prompt_require_yes("Type YES to continue: ")) {
+            return false;
+        }
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->device = device;
+    out->target = target;
+    out->fstype = do_format ? fstype : 0;
+    out->label = (do_format && label[0] != '\0') ? label : 0;
+    out->dry_run = dry_run;
+    out->force = true;
+    out->yes = true;
+    out->confirm = out->device;
+    out->trusted = do_format;
+    return true;
+}
+
+static void cmd_format(char *args) {
+    storaged_args_t parsed;
+    storaged_args_t interactive;
+    const char *fstype;
+    storage_status_t status;
+
+    if (!args || *skip_spaces(args) == '\0') {
+        if (!cmd_format_interactive(&interactive)) {
+            console_write("format: cancelled\n");
+            return;
+        }
+        parsed = interactive;
+    } else {
+        if (!storaged_parse_args(args, &parsed)) {
+            console_write("format: invalid arguments\n");
+            cmd_format_usage();
+            return;
+        }
+        if (!parsed.device) {
+            console_write("format: requires --device\n");
+            cmd_format_usage();
+            return;
+        }
+    }
+
+    fstype = parsed.fstype ? parsed.fstype : "ext4";
+    status = storage_format(parsed.device, fstype, parsed.label, parsed.force, parsed.dry_run,
+                            storaged_confirmed(&parsed));
+    if (status != STORAGE_OK) {
+        if (status == STORAGE_ERR_CONFIRMATION_REQUIRED) {
+            console_write("format: requires --force --confirm <device> --yes\n");
+            return;
+        }
+        console_write("format: ");
+        console_write(storage_status_string(status));
+        console_putc('\n');
+        return;
+    }
+
+    if (parsed.dry_run) {
+        console_write("dry-run: format ");
+        console_write(parsed.device);
+        console_write(" as ");
+        console_write(fstype);
+        console_putc('\n');
+        return;
+    }
+
+    console_write("format: completed\n");
+    shell_print_device_summary(parsed.device);
+}
+
+static void cmd_install(char *args) {
+    storaged_args_t parsed;
+    storaged_args_t interactive;
+    const char *fstype;
+    storage_status_t status;
+    bool do_format;
+    bool interactive_mode = (!args || *skip_spaces(args) == '\0');
+
+    if (interactive_mode) {
+        if (!cmd_install_interactive(&interactive)) {
+            console_write("install: cancelled\n");
+            return;
+        }
+        parsed = interactive;
+    } else {
+        if (!storaged_parse_args(args, &parsed)) {
+            console_write("install: invalid arguments\n");
+            cmd_install_usage();
+            return;
+        }
+        if (!parsed.device || !parsed.target) {
+            console_write("install: requires --device and --target\n");
+            cmd_install_usage();
+            return;
+        }
+    }
+
+    fstype = parsed.fstype ? parsed.fstype : "ext4";
+    do_format = interactive_mode ? parsed.trusted : true;
+
+    if (do_format) {
+        status = storage_format(parsed.device, fstype, parsed.label, parsed.force, parsed.dry_run,
+                                storaged_confirmed(&parsed));
+        if (status != STORAGE_OK) {
+            if (status == STORAGE_ERR_CONFIRMATION_REQUIRED) {
+                console_write("install: requires --force --confirm <device> --yes\n");
+                return;
+            }
+            console_write("install: format failed: ");
+            console_write(storage_status_string(status));
+            console_putc('\n');
+            return;
+        }
+    }
+
+    status = storage_install(parsed.device, parsed.target, parsed.force, parsed.dry_run,
+                             storaged_confirmed(&parsed));
+    if (status != STORAGE_OK) {
+        if (status == STORAGE_ERR_CONFIRMATION_REQUIRED) {
+            console_write("install: requires --force --confirm <device> --yes\n");
+            return;
+        }
+        console_write("install: seed failed: ");
+        console_write(storage_status_string(status));
+        console_putc('\n');
+        return;
+    }
+
+    if (parsed.dry_run) {
+        console_write("dry-run: install pipeline ");
+        console_write(parsed.device);
+        console_write(" -> ");
+        console_write(parsed.target);
+        console_putc('\n');
+        return;
+    }
+
+    console_write("install: completed\n");
+    shell_print_device_summary(parsed.device);
+}
+
 static void cmd_storaged_usage(void) {
     console_write("Usage: storaged <command> [options]\n");
     console_write("Commands:\n");
@@ -321,6 +923,8 @@ static void cmd_storaged_usage(void) {
     console_write("  fsck --device <path> [--dry-run] [--force --confirm <path> --yes]\n");
     console_write("  format --device <path> [--fstype ext4|vfat|xfs] [--label <name>] [--dry-run]\n");
     console_write("         [--force --confirm <path> --yes]\n");
+    console_write("  install --device <path> --target <dir> [--dry-run]\n");
+    console_write("          [--force --confirm <path> --yes]\n");
 }
 
 static void cmd_storaged_lsblk(const storaged_args_t *args) {
@@ -550,6 +1154,36 @@ static void cmd_storaged_format(const storaged_args_t *args) {
     console_write("storaged: format ok\n");
 }
 
+static void cmd_storaged_install(const storaged_args_t *args) {
+    storage_status_t status;
+
+    if (!args->device || !args->target) {
+        console_write("storaged: install requires --device and --target\n");
+        return;
+    }
+
+    status = storage_install(args->device, args->target, args->force, args->dry_run, storaged_confirmed(args));
+    if (status != STORAGE_OK) {
+        if (status == STORAGE_ERR_CONFIRMATION_REQUIRED) {
+            console_write("storaged: install requires --force --confirm <device> --yes\n");
+            return;
+        }
+        console_write_storage_error(status);
+        return;
+    }
+
+    if (args->dry_run) {
+        console_write("dry-run: install unix-like system ");
+        console_write(args->device);
+        console_write(" -> ");
+        console_write(args->target);
+        console_putc('\n');
+        return;
+    }
+
+    console_write("storaged: install ok\n");
+}
+
 static void cmd_storaged(char *args) {
     char *cursor = skip_spaces(args);
     char *subcmd = next_token(&cursor);
@@ -592,6 +1226,10 @@ static void cmd_storaged(char *args) {
     }
     if (strcmp(subcmd, "format") == 0) {
         cmd_storaged_format(&parsed);
+        return;
+    }
+    if (strcmp(subcmd, "install") == 0) {
+        cmd_storaged_install(&parsed);
         return;
     }
 
@@ -1005,30 +1643,76 @@ static void cmd_write(char *args, bool append) {
     console_write(append ? "append: ok\n" : "write: ok\n");
 }
 
+static void cmd_reboot(void) {
+    console_write("reboot: issuing machine reset\n");
+    machine_reboot();
+}
+
+static void cmd_poweroff(void) {
+    console_write("poweroff: requesting machine shutdown\n");
+    machine_poweroff();
+}
+
+static void cmd_ui_usage(void) {
+    console_write("Usage: ui <show|compact|comfortable>\n");
+}
+
+static void cmd_ui(char *args) {
+    char *cursor = skip_spaces(args);
+    char *sub = next_token(&cursor);
+
+    if (!sub || strcmp(sub, "show") == 0) {
+        console_write("ui: backend=");
+        console_write(console_framebuffer_enabled() ? "framebuffer" : "vga");
+        console_write(" font_scale=");
+        console_write_dec(console_font_scale());
+        console_write(" grid=");
+        console_write_dec((uint64_t)console_columns());
+        console_putc('x');
+        console_write_dec((uint64_t)console_rows());
+        console_putc('\n');
+        return;
+    }
+
+    if (strcmp(sub, "compact") == 0) {
+        if (!console_set_font_scale(1)) {
+            console_write("ui: compact mode unavailable on current backend\n");
+            return;
+        }
+        console_write("ui: compact mode enabled\n");
+        return;
+    }
+
+    if (strcmp(sub, "comfortable") == 0 || strcmp(sub, "comfy") == 0 || strcmp(sub, "modern") == 0) {
+        if (!console_set_font_scale(2)) {
+            console_write("ui: comfortable mode unavailable on current backend\n");
+            return;
+        }
+        console_write("ui: comfortable mode enabled\n");
+        return;
+    }
+
+    cmd_ui_usage();
+}
+
 static void cmd_help(void) {
-    console_write("Commands:\n");
-    console_write("  help              - show this help\n");
-    console_write("  clear             - clear the screen\n");
-    console_write("  pwd               - print current directory\n");
-    console_write("  ls [-a] [-l] [p]  - list files/dirs\n");
-    console_write("  cd [path]         - change directory (~=/home, -=previous)\n");
-    console_write("  mkdir [-p] <p...> - create directory/directories\n");
-    console_write("  touch <path>      - create empty file\n");
-    console_write("  cat <path>        - print file contents\n");
-    console_write("  write <p> <text>  - overwrite file with text\n");
-    console_write("  append <p> <text> - append text to file\n");
-    console_write("  nano <path>       - nano-like text editor\n");
-    console_write("  meminfo           - show memory/timer stats\n");
-    console_write("  kbdinfo           - show keyboard modifier/lock/layout state\n");
-    console_write("  kbdctl ...        - keyboard layout/repeat controls\n");
-    console_write("  showkey [...]     - inspect buffered key events\n");
-    console_write("  ttyinfo           - show tty RX/drop counters\n");
-    console_write("  session           - show active session and controlling pty\n");
-    console_write("  health            - show subsystem fault/overflow counters\n");
-    console_write("  selftest          - run input/pty stress self-test\n");
-    console_write("  ansi              - print ANSI color demo\n");
-    console_write("  echo ...          - print text\n");
-    console_write("  storaged ...      - disk operations (kernel backend)\n");
+    console_write("WaluOS command guide:\n");
+    console_write("  help                    - show this help\n");
+    console_write("  clear                   - clear screen\n");
+    console_write("  ui show|compact|comfortable - terminal readability mode\n");
+    console_write("File and text:\n");
+    console_write("  pwd | ls [-a] [-l] [p] | cd [path]\n");
+    console_write("  mkdir [-p] <p...> | touch <path>\n");
+    console_write("  cat <path> | write <p> <text> | append <p> <text>\n");
+    console_write("  nano <path>             - easy in-kernel text editor\n");
+    console_write("System:\n");
+    console_write("  meminfo | ttyinfo | session | health | selftest\n");
+    console_write("  kbdinfo | kbdctl ... | showkey [...]\n");
+    console_write("  format ...              - interactive or scripted format\n");
+    console_write("  install ...             - one-shot format+seed install\n");
+    console_write("  storaged ...            - disk operations\n");
+    console_write("  reboot/reset | poweroff/shutdown\n");
+    console_write("  ansi | echo ...\n");
 }
 
 static void cmd_meminfo(void) {
@@ -1410,6 +2094,21 @@ static void execute_command(char *line) {
         return;
     }
 
+    if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "reset") == 0) {
+        cmd_reboot();
+        return;
+    }
+
+    if (strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "shutdown") == 0) {
+        cmd_poweroff();
+        return;
+    }
+
+    if (strcmp(cmd, "ui") == 0) {
+        cmd_ui(cursor);
+        return;
+    }
+
     if (strcmp(cmd, "meminfo") == 0) {
         cmd_meminfo();
         return;
@@ -1460,6 +2159,16 @@ static void execute_command(char *line) {
         return;
     }
 
+    if (strcmp(cmd, "format") == 0) {
+        cmd_format(cursor);
+        return;
+    }
+
+    if (strcmp(cmd, "install") == 0) {
+        cmd_install(cursor);
+        return;
+    }
+
     if (strcmp(cmd, "echo") == 0) {
         if (*cursor != '\0') {
             console_write(cursor);
@@ -1475,6 +2184,16 @@ static void execute_command(char *line) {
         console_write(cursor);
     }
     console_putc('\n');
+    {
+        const char *hint = suggest_command(cmd);
+        if (hint) {
+            console_write("Tip: try `");
+            console_write(hint);
+            console_write("`\n");
+        } else {
+            console_write("Tip: type `help` for available commands\n");
+        }
+    }
 }
 
 static void shell_handle_input_byte(char c) {
@@ -1530,6 +2249,8 @@ void shell_init(void) {
     editor_init(&shell_editor);
     tty_set_canonical(true);
     tty_set_echo(true);
+    console_write("\x1B[1;36mWelcome to WaluOS TUI\x1B[0m\n");
+    console_write("Comfort UX: type `ui show` or `ui comfortable`\n");
     shell_prompt();
 }
 

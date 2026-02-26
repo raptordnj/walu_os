@@ -22,6 +22,7 @@ SCRIPT_DIR := scripts
 C_SRCS := \
 	kernel/src/core/kernel.c \
 	kernel/src/core/console.c \
+	kernel/src/core/machine.c \
 	kernel/src/core/pmm.c \
 	kernel/src/core/vmm.c \
 	kernel/src/core/pic.c \
@@ -46,7 +47,7 @@ OBJS := $(patsubst kernel/src/%, $(OBJ_DIR)/%, $(C_SRCS:.c=.o) $(ASM_SRCS:.S=.o)
 
 .PHONY: all clean iso run run-headless rust userland test-userland \
 	toolchain-bootstrap kernel-compile-check kernel-host-tests test-kernel \
-	test boot-smoke package-artifacts ci
+	test boot-smoke package-artifacts install-storage install-image ci
 
 all: iso
 
@@ -109,5 +110,40 @@ boot-smoke:
 
 package-artifacts:
 	bash $(SCRIPT_DIR)/package_artifacts.sh
+
+install-storage: $(KERNEL_ELF)
+	@if [[ -z "$(DEVICE)" && -z "$(IMAGE)" ]]; then \
+		echo "set DEVICE=/dev/sdX or IMAGE=build/waluos-disk.img"; \
+		exit 1; \
+	fi
+	bash $(SCRIPT_DIR)/install_storage.sh \
+		$(if $(DEVICE),--device $(DEVICE),) \
+		$(if $(IMAGE),--image $(IMAGE),) \
+		$(if $(SIZE_MIB),--size-mib $(SIZE_MIB),) \
+		$(if $(ESP_SIZE_MIB),--esp-size-mib $(ESP_SIZE_MIB),) \
+		--kernel $(KERNEL_ELF) \
+		$(if $(GRUB_CFG),--grub-config $(GRUB_CFG),) \
+		$(if $(ROOT_LABEL),--root-label $(ROOT_LABEL),) \
+		$(if $(EFI_LABEL),--efi-label $(EFI_LABEL),) \
+		$(if $(FORCE),--force,) \
+		$(if $(CONFIRM),--confirm $(CONFIRM),) \
+		$(if $(YES),--yes,) \
+		$(if $(SKIP_DRIVER_LOAD),--skip-driver-load,) \
+		$(if $(DRY_RUN),--dry-run,)
+
+install-image: $(KERNEL_ELF)
+	bash $(SCRIPT_DIR)/install_storage.sh \
+		--image $(if $(IMAGE),$(IMAGE),build/waluos-disk.img) \
+		$(if $(SIZE_MIB),--size-mib $(SIZE_MIB),) \
+		$(if $(ESP_SIZE_MIB),--esp-size-mib $(ESP_SIZE_MIB),) \
+		--kernel $(KERNEL_ELF) \
+		$(if $(GRUB_CFG),--grub-config $(GRUB_CFG),) \
+		$(if $(ROOT_LABEL),--root-label $(ROOT_LABEL),) \
+		$(if $(EFI_LABEL),--efi-label $(EFI_LABEL),) \
+		$(if $(FORCE),--force,) \
+		$(if $(CONFIRM),--confirm $(CONFIRM),) \
+		$(if $(YES),--yes,) \
+		$(if $(SKIP_DRIVER_LOAD),--skip-driver-load,) \
+		$(if $(DRY_RUN),--dry-run,)
 
 ci: test boot-smoke package-artifacts

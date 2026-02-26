@@ -3,6 +3,7 @@
 #include <kernel/idt.h>
 #include <kernel/io.h>
 #include <kernel/keyboard.h>
+#include <kernel/machine.h>
 #include <kernel/multiboot2.h>
 #include <kernel/pic.h>
 #include <kernel/pit.h>
@@ -17,10 +18,7 @@
 #include <kernel/vmm.h>
 
 static void halt_forever(void) {
-    cli();
-    for (;;) {
-        hlt();
-    }
+    machine_halt();
 }
 
 void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr) {
