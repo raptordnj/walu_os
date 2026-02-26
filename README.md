@@ -49,7 +49,7 @@ make test
 ```
 
 ## Boot smoke test (QEMU + ISO)
-Requires host tools: `grub-mkrescue`, `xorriso`, `mtools` (`mformat`), `qemu-system-x86_64`, `timeout`.
+Requires host tools: `grub-mkrescue`, `xorriso`, `mtools` (`mformat`), `qemu-system-x86_64`, `timeout`, and UEFI firmware files from `ovmf`.
 ```bash
 make boot-smoke
 ```

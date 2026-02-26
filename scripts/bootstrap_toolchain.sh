@@ -25,6 +25,9 @@ link_or_wrap() {
   local resolved=""
   if command -v "$target_name" >/dev/null 2>&1; then
     resolved="$(command -v "$target_name")"
+    if [[ "$resolved" == "$out" ]]; then
+      return
+    fi
     ln -sf "$resolved" "$out"
     return
   fi
