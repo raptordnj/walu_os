@@ -1,4 +1,5 @@
 #include <kernel/console.h>
+#include <kernel/editor.h>
 #include <kernel/fs.h>
 #include <kernel/keyboard.h>
 #include <kernel/pit.h>
@@ -17,6 +18,7 @@
 static char shell_line[SHELL_LINE_MAX];
 static size_t shell_len = 0;
 static char shell_prev_dir[256];
+static editor_state_t shell_editor;
 
 static key_event_t showkey_ring[SHOWKEY_RING_SIZE];
 static size_t showkey_head = 0;
@@ -661,6 +663,90 @@ static void print_ls_dot_entries(bool long_format) {
     print_ls_entry(&dotdot, long_format);
 }
 
+static void editor_render(void) {
+    console_write("\x1B[2J\x1B[H");
+    console_write("\x1B[1;44;37m Walu Nano ");
+    console_write(shell_editor.path);
+    if (shell_editor.dirty) {
+        console_write(" [modified]");
+    }
+    console_write(" \x1B[0m\n");
+    console_write("Ctrl+O Save | Ctrl+X Exit | Arrows Move | Backspace Delete\n");
+    console_write("----------------------------------------------------------------\n");
+
+    for (size_t i = 0; i <= shell_editor.len; i++) {
+        if (i == shell_editor.cursor) {
+            console_write("\x1B[7m \x1B[0m");
+        }
+        if (i == shell_editor.len) {
+            break;
+        }
+        if ((unsigned char)shell_editor.text[i] < 0x20 && shell_editor.text[i] != '\n' && shell_editor.text[i] != '\t') {
+            console_putc('?');
+        } else {
+            console_putc(shell_editor.text[i]);
+        }
+    }
+    console_write("\n----------------------------------------------------------------\n");
+    if (shell_editor.status[0] != '\0') {
+        console_write(shell_editor.status);
+    } else {
+        console_write("editing");
+    }
+    console_putc('\n');
+}
+
+static void editor_leave(void) {
+    editor_init(&shell_editor);
+    tty_set_canonical(true);
+    tty_set_echo(true);
+    console_clear();
+    shell_prompt();
+}
+
+static void shell_handle_editor_input(char c) {
+    editor_handle_input(&shell_editor, (uint8_t)c);
+    if (editor_take_save_request(&shell_editor)) {
+        fs_status_t st = editor_save(&shell_editor);
+        if (st != FS_OK) {
+            editor_set_status(&shell_editor, "save failed");
+        }
+    }
+    if (editor_take_exit_request(&shell_editor)) {
+        editor_leave();
+        return;
+    }
+    editor_render();
+}
+
+static void cmd_nano(char *args) {
+    char *cursor = skip_spaces(args);
+    char *path = next_token(&cursor);
+    fs_status_t st = FS_OK;
+
+    if (!path) {
+        console_write("nano: missing path\n");
+        return;
+    }
+    if (next_token(&cursor) != 0) {
+        console_write("nano: too many arguments\n");
+        return;
+    }
+
+    if (!editor_open(&shell_editor, path, &st)) {
+        console_write("nano: ");
+        console_write(path);
+        console_write(": ");
+        console_write(fs_status_string(st));
+        console_putc('\n');
+        return;
+    }
+
+    tty_set_canonical(false);
+    tty_set_echo(false);
+    editor_render();
+}
+
 static void cmd_pwd(void) {
     char path[256];
     fs_status_t st = fs_pwd(path, sizeof(path));
@@ -931,6 +1017,7 @@ static void cmd_help(void) {
     console_write("  cat <path>        - print file contents\n");
     console_write("  write <p> <text>  - overwrite file with text\n");
     console_write("  append <p> <text> - append text to file\n");
+    console_write("  nano <path>       - nano-like text editor\n");
     console_write("  meminfo           - show memory/timer stats\n");
     console_write("  kbdinfo           - show keyboard modifier/lock/layout state\n");
     console_write("  kbdctl ...        - keyboard layout/repeat controls\n");
@@ -1318,6 +1405,11 @@ static void execute_command(char *line) {
         return;
     }
 
+    if (strcmp(cmd, "nano") == 0) {
+        cmd_nano(cursor);
+        return;
+    }
+
     if (strcmp(cmd, "meminfo") == 0) {
         cmd_meminfo();
         return;
@@ -1386,6 +1478,11 @@ static void execute_command(char *line) {
 }
 
 static void shell_handle_input_byte(char c) {
+    if (shell_editor.active) {
+        shell_handle_editor_input(c);
+        return;
+    }
+
     if (c == 0x03) {
         shell_len = 0;
         shell_prompt();
@@ -1405,7 +1502,9 @@ static void shell_handle_input_byte(char c) {
         shell_line[shell_len] = '\0';
         execute_command(shell_line);
         shell_len = 0;
-        shell_prompt();
+        if (!shell_editor.active) {
+            shell_prompt();
+        }
         return;
     }
 
@@ -1428,6 +1527,7 @@ void shell_init(void) {
     showkey_count = 0;
     showkey_live = false;
     shell_copy(shell_prev_dir, sizeof(shell_prev_dir), "/");
+    editor_init(&shell_editor);
     tty_set_canonical(true);
     tty_set_echo(true);
     shell_prompt();

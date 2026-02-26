@@ -8,6 +8,7 @@ OUT_BIN="/tmp/walu_kernel_host_tests"
 KBD_OUT_BIN="/tmp/walu_keyboard_host_tests"
 STORAGE_OUT_BIN="/tmp/walu_storage_host_tests"
 FS_OUT_BIN="/tmp/walu_fs_host_tests"
+EDITOR_OUT_BIN="/tmp/walu_editor_host_tests"
 
 # Host tests should use libc memory primitives to avoid freestanding/builtin
 # optimization recursion that can occur with kernel string.c at -O2.
@@ -34,3 +35,9 @@ gcc -std=gnu11 -Wall -Wextra -O2 -fno-builtin -Ikernel/include \
   -o "$FS_OUT_BIN"
 
 "$FS_OUT_BIN"
+
+gcc -std=gnu11 -Wall -Wextra -O2 -fno-builtin -Ikernel/include \
+  kernel/tests/test_editor.c kernel/src/core/editor.c kernel/src/core/fs.c kernel/src/lib/string.c \
+  -o "$EDITOR_OUT_BIN"
+
+"$EDITOR_OUT_BIN"
