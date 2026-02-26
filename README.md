@@ -14,14 +14,18 @@ WaluOS is a minimal hobby OS kernel for x86_64.
 - Keyboard IRQ key-event queue + UTF-8 byte queue
 - Extended key handling (arrows/home/end/insert/delete/page keys, F1-F12 to ANSI escapes)
 - Modifier/lock tracking (Shift/Ctrl/Alt/AltGr/Meta, Caps/Num/Scroll lock)
+- Unicode compose input (`Ctrl+Shift+U` + hex + Enter/Space) for arbitrary code points
+- Runtime keyboard controls (`kbdctl`) for layout (`us`, `us-intl`) and repeat tuning
+- Key-event inspection (`showkey`, optional live mode) with buffered recent events
 - TTY line discipline (canonical mode + echo + safe input filtering)
 - PTY channel skeleton (master/slave ring buffers)
 - Subsystem fault counters for keyboard/TTY/PTY overflow and invalid operations
-- Tiny shell commands: `help`, `clear`, `meminfo`, `kbdinfo`, `ttyinfo`, `health`, `ansi`, `echo`
+- Tiny shell commands: `help`, `clear`, `pwd`, `ls`, `cd`, `mkdir`, `touch`, `cat`, `write`, `append`, `meminfo`, `kbdinfo`, `kbdctl`, `showkey`, `storaged`, `ttyinfo`, `health`, `ansi`, `echo`
 - Shell control input support (`Ctrl-C`, `Ctrl-L`) via TTY pipeline
 - Rust `#![no_std]` static library linked into the C kernel
 - Architecture blueprint and implementation roadmap in `docs/`
 - Userland service scaffolding in `userland/` (`walud`, `authd`, `storaged`)
+- `storaged` now includes Linux-like disk operations (`lsblk`, `blkid`, `mount`, `umount`, `fsck`, `format`) with strict safety gates
 
 ## Build locally (toolchain on host)
 ```bash
@@ -42,6 +46,7 @@ make test-userland
 ```bash
 make test-kernel
 ```
+Includes TTY/PTY, keyboard mapping/Unicode compose, and storage policy host tests.
 
 ## Full local validation pipeline
 ```bash

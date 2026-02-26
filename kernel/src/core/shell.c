@@ -1,4 +1,5 @@
 #include <kernel/console.h>
+#include <kernel/fs.h>
 #include <kernel/keyboard.h>
 #include <kernel/pit.h>
 #include <kernel/pmm.h>
@@ -6,30 +7,732 @@
 #include <kernel/rust.h>
 #include <kernel/session.h>
 #include <kernel/shell.h>
+#include <kernel/storage.h>
 #include <kernel/string.h>
 #include <kernel/tty.h>
 
 #define SHELL_LINE_MAX 128
+#define SHOWKEY_RING_SIZE 64
 
 static char shell_line[SHELL_LINE_MAX];
 static size_t shell_len = 0;
+
+static key_event_t showkey_ring[SHOWKEY_RING_SIZE];
+static size_t showkey_head = 0;
+static size_t showkey_count = 0;
+static bool showkey_live = false;
+
+typedef struct {
+    const char *device;
+    const char *target;
+    const char *fstype;
+    const char *label;
+    const char *confirm;
+    bool dry_run;
+    bool force;
+    bool yes;
+    bool trusted;
+    bool read_write;
+    bool lazy;
+    bool json;
+} storaged_args_t;
 
 static void shell_prompt(void) {
     console_write("\x1B[1;32mwalu\x1B[0m> ");
 }
 
+static void console_write_uplus(uint32_t cp) {
+    char digits[8];
+    size_t n = 0;
+    int i;
+
+    if (cp == 0) {
+        console_write("U+0000");
+        return;
+    }
+
+    while (cp > 0 && n < sizeof(digits)) {
+        uint8_t nibble = (uint8_t)(cp & 0xF);
+        digits[n++] = (char)(nibble < 10 ? ('0' + nibble) : ('A' + nibble - 10));
+        cp >>= 4;
+    }
+
+    console_write("U+");
+    if (n < 4) {
+        for (size_t pad = n; pad < 4; pad++) {
+            console_putc('0');
+        }
+    }
+
+    for (i = (int)n - 1; i >= 0; i--) {
+        console_putc(digits[i]);
+    }
+}
+
+static char *skip_spaces(char *s) {
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    return s;
+}
+
+static char *next_token(char **cursor) {
+    char *start;
+    char *p;
+
+    if (cursor == 0 || *cursor == 0) {
+        return 0;
+    }
+
+    p = skip_spaces(*cursor);
+    if (*p == '\0') {
+        *cursor = p;
+        return 0;
+    }
+
+    start = p;
+    while (*p != '\0' && *p != ' ' && *p != '\t') {
+        p++;
+    }
+    if (*p != '\0') {
+        *p = '\0';
+        p++;
+    }
+    *cursor = p;
+    return start;
+}
+
+static bool parse_u32(const char *s, uint32_t *out) {
+    uint64_t value = 0;
+    size_t i = 0;
+
+    if (s == 0 || *s == '\0' || out == 0) {
+        return false;
+    }
+
+    while (s[i] != '\0') {
+        char c = s[i];
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        value = (value * 10u) + (uint64_t)(c - '0');
+        if (value > 0xFFFFFFFFu) {
+            return false;
+        }
+        i++;
+    }
+
+    *out = (uint32_t)value;
+    return true;
+}
+
+static void showkey_record_event(const key_event_t *ev) {
+    showkey_ring[showkey_head] = *ev;
+    showkey_head = (showkey_head + 1) % SHOWKEY_RING_SIZE;
+    if (showkey_count < SHOWKEY_RING_SIZE) {
+        showkey_count++;
+    }
+}
+
+static void showkey_print_event(const key_event_t *ev) {
+    console_write(ev->pressed ? "DOWN " : "UP   ");
+    console_write(keyboard_keycode_name(ev->keycode));
+    console_write(" mods=0x");
+    console_write_hex((uint64_t)ev->modifiers);
+    console_write(" locks=0x");
+    console_write_hex((uint64_t)ev->locks);
+    console_write(" repeat=");
+    console_write(ev->repeat ? "1" : "0");
+    console_write(" unicode=");
+    if (ev->unicode == 0) {
+        console_write("-");
+    } else {
+        console_write_uplus(ev->unicode);
+    }
+    console_putc('\n');
+}
+
+static void collect_keyboard_events(void) {
+    key_event_t ev;
+
+    while (keyboard_pop_event(&ev)) {
+        showkey_record_event(&ev);
+        if (showkey_live) {
+            showkey_print_event(&ev);
+        }
+    }
+}
+
+static void cmd_showkey(char *args) {
+    size_t base;
+    char *token;
+    char *arg0;
+    char *arg1;
+    char *cursor = skip_spaces(args);
+
+    if (*cursor == '\0') {
+        if (showkey_count == 0) {
+            console_write("showkey: no buffered key events\n");
+            return;
+        }
+
+        base = (showkey_head + SHOWKEY_RING_SIZE - showkey_count) % SHOWKEY_RING_SIZE;
+        for (size_t i = 0; i < showkey_count; i++) {
+            size_t idx = (base + i) % SHOWKEY_RING_SIZE;
+            showkey_print_event(&showkey_ring[idx]);
+        }
+        return;
+    }
+
+    arg0 = next_token(&cursor);
+    if (arg0 == 0) {
+        return;
+    }
+
+    if (strcmp(arg0, "clear") == 0) {
+        showkey_head = 0;
+        showkey_count = 0;
+        console_write("showkey: buffer cleared\n");
+        return;
+    }
+
+    if (strcmp(arg0, "live") == 0) {
+        arg1 = next_token(&cursor);
+        if (arg1 && strcmp(arg1, "on") == 0) {
+            showkey_live = true;
+            console_write("showkey: live mode enabled\n");
+            return;
+        }
+        if (arg1 && strcmp(arg1, "off") == 0) {
+            showkey_live = false;
+            console_write("showkey: live mode disabled\n");
+            return;
+        }
+        console_write("Usage: showkey [clear|live on|live off]\n");
+        return;
+    }
+
+    token = next_token(&cursor);
+    (void)token;
+    console_write("Usage: showkey [clear|live on|live off]\n");
+}
+
+static void console_write_storage_error(storage_status_t status) {
+    console_write("storaged: ");
+    console_write(storage_status_string(status));
+    console_putc('\n');
+}
+
+static void console_write_bool(bool value) {
+    console_write(value ? "1" : "0");
+}
+
+static void console_write_kib(uint64_t bytes) {
+    console_write_dec(bytes / 1024u);
+}
+
+static bool storaged_parse_args(char *cursor, storaged_args_t *args) {
+    char *token;
+    memset(args, 0, sizeof(*args));
+
+    while ((token = next_token(&cursor)) != 0) {
+        if (strcmp(token, "--device") == 0) {
+            args->device = next_token(&cursor);
+            if (!args->device) {
+                return false;
+            }
+        } else if (strcmp(token, "--target") == 0) {
+            args->target = next_token(&cursor);
+            if (!args->target) {
+                return false;
+            }
+        } else if (strcmp(token, "--fstype") == 0) {
+            args->fstype = next_token(&cursor);
+            if (!args->fstype) {
+                return false;
+            }
+        } else if (strcmp(token, "--label") == 0) {
+            args->label = next_token(&cursor);
+            if (!args->label) {
+                return false;
+            }
+        } else if (strcmp(token, "--confirm") == 0) {
+            args->confirm = next_token(&cursor);
+            if (!args->confirm) {
+                return false;
+            }
+        } else if (strcmp(token, "--dry-run") == 0) {
+            args->dry_run = true;
+        } else if (strcmp(token, "--force") == 0) {
+            args->force = true;
+        } else if (strcmp(token, "--yes") == 0) {
+            args->yes = true;
+        } else if (strcmp(token, "--trusted") == 0) {
+            args->trusted = true;
+        } else if (strcmp(token, "--read-write") == 0) {
+            args->read_write = true;
+        } else if (strcmp(token, "--lazy") == 0) {
+            args->lazy = true;
+        } else if (strcmp(token, "--json") == 0) {
+            args->json = true;
+        } else {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool storaged_confirmed(const storaged_args_t *args) {
+    return args->force && args->yes && args->confirm && args->device &&
+           strcmp(args->confirm, args->device) == 0;
+}
+
+static void cmd_storaged_usage(void) {
+    console_write("Usage: storaged <command> [options]\n");
+    console_write("Commands:\n");
+    console_write("  lsblk [--json] [--device <path>]\n");
+    console_write("  blkid [--device <path>]\n");
+    console_write("  probe --device <path>\n");
+    console_write("  mount --device <path> --target <dir> [--read-write] [--trusted] [--force] [--dry-run]\n");
+    console_write("  umount --target <dir|device> [--lazy] [--dry-run]\n");
+    console_write("  fsck --device <path> [--dry-run] [--force --confirm <path> --yes]\n");
+    console_write("  format --device <path> [--fstype ext4|vfat|xfs] [--label <name>] [--dry-run]\n");
+    console_write("         [--force --confirm <path> --yes]\n");
+}
+
+static void cmd_storaged_lsblk(const storaged_args_t *args) {
+    size_t n = storage_device_count();
+    storage_device_info_t info;
+
+    if (args->json) {
+        console_write("storaged: --json not available in kernel backend (text output shown)\n");
+    }
+
+    console_write("NAME PATH SIZE_KiB RM RO FSTYPE MOUNT\n");
+    for (size_t i = 0; i < n; i++) {
+        if (!storage_device_info(i, &info)) {
+            continue;
+        }
+        if (args->device && strcmp(args->device, info.path) != 0) {
+            continue;
+        }
+        console_write(info.name);
+        console_putc(' ');
+        console_write(info.path);
+        console_putc(' ');
+        console_write_kib(info.size_bytes);
+        console_putc(' ');
+        console_write_bool(info.removable);
+        console_putc(' ');
+        console_write_bool(info.read_only);
+        console_putc(' ');
+        console_write(info.formatted ? info.fstype : "-");
+        console_putc(' ');
+        console_write((info.mountpoint && info.mountpoint[0] != '\0') ? info.mountpoint : "-");
+        if (info.mountpoint && info.mountpoint[0] != '\0') {
+            console_putc('(');
+            console_write(info.mount_read_write ? "rw" : "ro");
+            console_putc(')');
+        }
+        console_putc('\n');
+    }
+}
+
+static void cmd_storaged_blkid(const storaged_args_t *args) {
+    size_t n = storage_device_count();
+    storage_device_info_t info;
+    bool printed = false;
+
+    for (size_t i = 0; i < n; i++) {
+        if (!storage_device_info(i, &info)) {
+            continue;
+        }
+        if (args->device && strcmp(args->device, info.path) != 0) {
+            continue;
+        }
+        if (!info.formatted) {
+            continue;
+        }
+        console_write(info.path);
+        console_write(": UUID=\"");
+        console_write(info.uuid);
+        console_write("\" TYPE=\"");
+        console_write(info.fstype);
+        console_write("\"");
+        if (info.label && info.label[0] != '\0') {
+            console_write(" LABEL=\"");
+            console_write(info.label);
+            console_write("\"");
+        }
+        console_putc('\n');
+        printed = true;
+    }
+
+    if (!printed) {
+        console_write("storaged: no matching formatted devices\n");
+    }
+}
+
+static void cmd_storaged_probe(const storaged_args_t *args) {
+    storage_device_info_t info;
+    if (!args->device) {
+        console_write("storaged: probe requires --device\n");
+        return;
+    }
+    if (!storage_find_device(args->device, &info)) {
+        console_write_storage_error(STORAGE_ERR_NOT_FOUND);
+        return;
+    }
+    console_write("device=");
+    console_write(info.path);
+    console_putc('\n');
+    console_write("name=");
+    console_write(info.name);
+    console_putc('\n');
+    console_write("size_kib=");
+    console_write_kib(info.size_bytes);
+    console_putc('\n');
+    console_write("removable=");
+    console_write_bool(info.removable);
+    console_putc('\n');
+    console_write("ro=");
+    console_write_bool(info.read_only);
+    console_putc('\n');
+    console_write("formatted=");
+    console_write_bool(info.formatted);
+    console_putc('\n');
+    if (info.formatted) {
+        console_write("fstype=");
+        console_write(info.fstype);
+        console_putc('\n');
+        console_write("uuid=");
+        console_write(info.uuid);
+        console_putc('\n');
+        console_write("label=");
+        console_write(info.label && info.label[0] ? info.label : "-");
+        console_putc('\n');
+    }
+    console_write("mount=");
+    console_write((info.mountpoint && info.mountpoint[0] != '\0') ? info.mountpoint : "-");
+    console_putc('\n');
+}
+
+static void cmd_storaged_mount(const storaged_args_t *args) {
+    storage_status_t status;
+
+    if (!args->device || !args->target) {
+        console_write("storaged: mount requires --device and --target\n");
+        return;
+    }
+
+    status = storage_mount(args->device, args->target, args->read_write, args->trusted, args->force, args->dry_run);
+    if (status != STORAGE_OK) {
+        console_write_storage_error(status);
+        return;
+    }
+
+    if (args->dry_run) {
+        console_write("dry-run: mount ");
+        console_write(args->device);
+        console_write(" -> ");
+        console_write(args->target);
+        console_putc('\n');
+        return;
+    }
+
+    console_write("storaged: mount ok\n");
+}
+
+static void cmd_storaged_umount(const storaged_args_t *args) {
+    storage_status_t status;
+
+    (void)args->lazy;
+    if (!args->target) {
+        console_write("storaged: umount requires --target\n");
+        return;
+    }
+
+    status = storage_umount_target(args->target, args->dry_run);
+    if (status != STORAGE_OK) {
+        console_write_storage_error(status);
+        return;
+    }
+
+    if (args->dry_run) {
+        console_write("dry-run: umount ");
+        console_write(args->target);
+        console_putc('\n');
+        return;
+    }
+
+    console_write("storaged: umount ok\n");
+}
+
+static void cmd_storaged_fsck(const storaged_args_t *args) {
+    storage_status_t status;
+
+    if (!args->device) {
+        console_write("storaged: fsck requires --device\n");
+        return;
+    }
+
+    status = storage_fsck(args->device, args->force, args->dry_run, storaged_confirmed(args));
+    if (status != STORAGE_OK) {
+        if (status == STORAGE_ERR_CONFIRMATION_REQUIRED) {
+            console_write("storaged: fsck destructive mode requires --force --confirm <device> --yes\n");
+            return;
+        }
+        console_write_storage_error(status);
+        return;
+    }
+
+    if (args->dry_run) {
+        console_write("dry-run: fsck ");
+        console_write(args->device);
+        console_putc('\n');
+        return;
+    }
+
+    console_write("storaged: fsck ok\n");
+}
+
+static void cmd_storaged_format(const storaged_args_t *args) {
+    storage_status_t status;
+    const char *fstype = args->fstype ? args->fstype : "ext4";
+
+    if (!args->device) {
+        console_write("storaged: format requires --device\n");
+        return;
+    }
+
+    status = storage_format(args->device, fstype, args->label, args->force, args->dry_run, storaged_confirmed(args));
+    if (status != STORAGE_OK) {
+        if (status == STORAGE_ERR_CONFIRMATION_REQUIRED) {
+            console_write("storaged: format requires --force --confirm <device> --yes\n");
+            return;
+        }
+        console_write_storage_error(status);
+        return;
+    }
+
+    if (args->dry_run) {
+        console_write("dry-run: mkfs.");
+        console_write(fstype);
+        console_write(" ");
+        console_write(args->device);
+        console_putc('\n');
+        return;
+    }
+
+    console_write("storaged: format ok\n");
+}
+
+static void cmd_storaged(char *args) {
+    char *cursor = skip_spaces(args);
+    char *subcmd = next_token(&cursor);
+    storaged_args_t parsed;
+
+    if (!subcmd || strcmp(subcmd, "help") == 0) {
+        cmd_storaged_usage();
+        return;
+    }
+
+    if (!storaged_parse_args(cursor, &parsed)) {
+        console_write("storaged: invalid arguments\n");
+        cmd_storaged_usage();
+        return;
+    }
+
+    if (strcmp(subcmd, "lsblk") == 0) {
+        cmd_storaged_lsblk(&parsed);
+        return;
+    }
+    if (strcmp(subcmd, "blkid") == 0) {
+        cmd_storaged_blkid(&parsed);
+        return;
+    }
+    if (strcmp(subcmd, "probe") == 0) {
+        cmd_storaged_probe(&parsed);
+        return;
+    }
+    if (strcmp(subcmd, "mount") == 0) {
+        cmd_storaged_mount(&parsed);
+        return;
+    }
+    if (strcmp(subcmd, "umount") == 0) {
+        cmd_storaged_umount(&parsed);
+        return;
+    }
+    if (strcmp(subcmd, "fsck") == 0) {
+        cmd_storaged_fsck(&parsed);
+        return;
+    }
+    if (strcmp(subcmd, "format") == 0) {
+        cmd_storaged_format(&parsed);
+        return;
+    }
+
+    console_write("storaged: unknown subcommand\n");
+    cmd_storaged_usage();
+}
+
+static void console_write_fs_error(fs_status_t status) {
+    console_write("fs: ");
+    console_write(fs_status_string(status));
+    console_putc('\n');
+}
+
+static void cmd_pwd(void) {
+    char path[256];
+    fs_status_t st = fs_pwd(path, sizeof(path));
+    if (st != FS_OK) {
+        console_write_fs_error(st);
+        return;
+    }
+    console_write(path);
+    console_putc('\n');
+}
+
+static void cmd_ls(char *args) {
+    char *cursor = skip_spaces(args);
+    char *path = next_token(&cursor);
+    fs_entry_t entries[64];
+    size_t count = 0;
+    fs_status_t st = fs_list(path, entries, sizeof(entries) / sizeof(entries[0]), &count);
+
+    if (st != FS_OK && st != FS_ERR_NO_SPACE) {
+        console_write_fs_error(st);
+        return;
+    }
+
+    for (size_t i = 0; i < count && i < (sizeof(entries) / sizeof(entries[0])); i++) {
+        console_write(entries[i].name);
+        if (entries[i].is_dir) {
+            console_putc('/');
+        } else {
+            console_write(" (");
+            console_write_dec((uint64_t)entries[i].size);
+            console_write("B)");
+        }
+        console_putc('\n');
+    }
+}
+
+static void cmd_cd(char *args) {
+    char *cursor = skip_spaces(args);
+    char *path = next_token(&cursor);
+    fs_status_t st;
+
+    if (!path) {
+        path = "/";
+    }
+    st = fs_chdir(path);
+    if (st != FS_OK) {
+        console_write_fs_error(st);
+    }
+}
+
+static void cmd_mkdir(char *args) {
+    char *cursor = skip_spaces(args);
+    char *path = next_token(&cursor);
+    fs_status_t st;
+
+    if (!path) {
+        console_write("mkdir: missing path\n");
+        return;
+    }
+
+    st = fs_mkdir(path);
+    if (st != FS_OK) {
+        console_write_fs_error(st);
+    }
+}
+
+static void cmd_touch(char *args) {
+    char *cursor = skip_spaces(args);
+    char *path = next_token(&cursor);
+    fs_status_t st;
+
+    if (!path) {
+        console_write("touch: missing path\n");
+        return;
+    }
+
+    st = fs_touch(path);
+    if (st != FS_OK) {
+        console_write_fs_error(st);
+    }
+}
+
+static void cmd_cat(char *args) {
+    char *cursor = skip_spaces(args);
+    char *path = next_token(&cursor);
+    char buf[513];
+    size_t len = 0;
+    fs_status_t st;
+
+    if (!path) {
+        console_write("cat: missing path\n");
+        return;
+    }
+
+    st = fs_read(path, buf, sizeof(buf), &len);
+    if (st != FS_OK) {
+        console_write_fs_error(st);
+        return;
+    }
+
+    if (len > 0) {
+        console_write(buf);
+    }
+    console_putc('\n');
+}
+
+static void cmd_write(char *args, bool append) {
+    char *cursor = skip_spaces(args);
+    char *path = next_token(&cursor);
+    char *text;
+    fs_status_t st;
+
+    if (!path) {
+        console_write(append ? "append: missing path\n" : "write: missing path\n");
+        return;
+    }
+
+    text = skip_spaces(cursor);
+    st = fs_write(path, text, append);
+    if (st != FS_OK) {
+        console_write_fs_error(st);
+        return;
+    }
+
+    console_write(append ? "append: ok\n" : "write: ok\n");
+}
+
 static void cmd_help(void) {
     console_write("Commands:\n");
-    console_write("  help     - show this help\n");
-    console_write("  clear    - clear the screen\n");
-    console_write("  meminfo  - show memory/timer stats\n");
-    console_write("  kbdinfo  - show keyboard modifier/lock state\n");
-    console_write("  ttyinfo  - show tty RX/drop counters\n");
-    console_write("  session  - show active session and controlling pty\n");
-    console_write("  health   - show subsystem fault/overflow counters\n");
-    console_write("  selftest - run input/pty stress self-test\n");
-    console_write("  ansi     - print ANSI color demo\n");
-    console_write("  echo ... - print text\n");
+    console_write("  help              - show this help\n");
+    console_write("  clear             - clear the screen\n");
+    console_write("  pwd               - print current directory\n");
+    console_write("  ls [path]         - list directory entries\n");
+    console_write("  cd [path]         - change directory (default /)\n");
+    console_write("  mkdir <path>      - create directory\n");
+    console_write("  touch <path>      - create empty file\n");
+    console_write("  cat <path>        - print file contents\n");
+    console_write("  write <p> <text>  - overwrite file with text\n");
+    console_write("  append <p> <text> - append text to file\n");
+    console_write("  meminfo           - show memory/timer stats\n");
+    console_write("  kbdinfo           - show keyboard modifier/lock/layout state\n");
+    console_write("  kbdctl ...        - keyboard layout/repeat controls\n");
+    console_write("  showkey [...]     - inspect buffered key events\n");
+    console_write("  ttyinfo           - show tty RX/drop counters\n");
+    console_write("  session           - show active session and controlling pty\n");
+    console_write("  health            - show subsystem fault/overflow counters\n");
+    console_write("  selftest          - run input/pty stress self-test\n");
+    console_write("  ansi              - print ANSI color demo\n");
+    console_write("  echo ...          - print text\n");
+    console_write("  storaged ...      - disk operations (kernel backend)\n");
 }
 
 static void cmd_meminfo(void) {
@@ -99,6 +802,122 @@ static void cmd_kbdinfo(void) {
         }
     }
     console_write(")\n");
+
+    console_write("Layout   : ");
+    console_write(keyboard_layout_name());
+    console_write("\n");
+
+    console_write("Repeat   : delay=");
+    console_write_dec((uint64_t)keyboard_repeat_delay_ms());
+    console_write("ms rate=");
+    console_write_dec((uint64_t)keyboard_repeat_rate_hz());
+    console_write("Hz\n");
+
+    console_write("Compose  : ");
+    if (!keyboard_unicode_compose_active()) {
+        console_write("inactive\n");
+    } else {
+        console_write("active ");
+        console_write_uplus(keyboard_unicode_compose_value());
+        console_write(" digits=");
+        console_write_dec((uint64_t)keyboard_unicode_compose_digits());
+        console_putc('\n');
+    }
+}
+
+static void cmd_kbdctl_usage(void) {
+    console_write("Usage: kbdctl <command>\n");
+    console_write("  show-layout\n");
+    console_write("  set-layout <us|us-intl>\n");
+    console_write("  show-repeat\n");
+    console_write("  set-repeat <delay_ms> <rate_hz>\n");
+    console_write("  show-compose\n");
+}
+
+static void cmd_kbdctl(char *args) {
+    char *cursor = skip_spaces(args);
+    char *cmd = next_token(&cursor);
+
+    if (cmd == 0) {
+        cmd_kbdctl_usage();
+        return;
+    }
+
+    if (strcmp(cmd, "show-layout") == 0) {
+        console_write("layout=");
+        console_write(keyboard_layout_name());
+        console_putc('\n');
+        return;
+    }
+
+    if (strcmp(cmd, "set-layout") == 0) {
+        char *name = next_token(&cursor);
+        if (name == 0) {
+            cmd_kbdctl_usage();
+            return;
+        }
+        if (strcmp(name, "us") == 0) {
+            keyboard_set_layout(KBD_LAYOUT_US);
+        } else if (strcmp(name, "us-intl") == 0) {
+            keyboard_set_layout(KBD_LAYOUT_US_INTL);
+        } else {
+            console_write("kbdctl: unsupported layout\n");
+            return;
+        }
+        console_write("layout=");
+        console_write(keyboard_layout_name());
+        console_putc('\n');
+        return;
+    }
+
+    if (strcmp(cmd, "show-repeat") == 0) {
+        console_write("delay_ms=");
+        console_write_dec((uint64_t)keyboard_repeat_delay_ms());
+        console_write(" rate_hz=");
+        console_write_dec((uint64_t)keyboard_repeat_rate_hz());
+        console_putc('\n');
+        return;
+    }
+
+    if (strcmp(cmd, "set-repeat") == 0) {
+        char *delay_s = next_token(&cursor);
+        char *rate_s = next_token(&cursor);
+        uint32_t delay;
+        uint32_t rate;
+
+        if (!delay_s || !rate_s || !parse_u32(delay_s, &delay) || !parse_u32(rate_s, &rate)) {
+            console_write("kbdctl: set-repeat expects integers\n");
+            return;
+        }
+
+        if (delay > 0xFFFFu || rate > 0xFFFFu) {
+            console_write("kbdctl: values too large\n");
+            return;
+        }
+
+        if (!keyboard_set_repeat((uint16_t)delay, (uint16_t)rate)) {
+            console_write("kbdctl: out of range (delay 150..2000, rate 1..60)\n");
+            return;
+        }
+
+        console_write("repeat updated\n");
+        return;
+    }
+
+    if (strcmp(cmd, "show-compose") == 0) {
+        if (!keyboard_unicode_compose_active()) {
+            console_write("compose=inactive\n");
+            return;
+        }
+        console_write("compose=active value=");
+        console_write_uplus(keyboard_unicode_compose_value());
+        console_write(" digits=");
+        console_write_dec((uint64_t)keyboard_unicode_compose_digits());
+        console_putc('\n');
+        return;
+    }
+
+    cmd_kbdctl_usage();
 }
 
 static void cmd_ansi(void) {
@@ -109,7 +928,7 @@ static void cmd_ansi(void) {
     console_write("\x1B[1;34mblue\x1B[0m ");
     console_write("\x1B[1;35mmagenta\x1B[0m ");
     console_write("\x1B[1;36mcyan\x1B[0m\n");
-    console_write("UTF-8 sample bytes: cafe, naive, jalapeno\n");
+    console_write("UTF-8 input: Ctrl+Shift+U <hex> <Enter|Space>\n");
 }
 
 static void cmd_ttyinfo(void) {
@@ -222,9 +1041,7 @@ static void cmd_selftest(void) {
 }
 
 static void execute_command(char *line) {
-    while (*line == ' ') {
-        line++;
-    }
+    line = skip_spaces(line);
 
     if (*line == '\0') {
         return;
@@ -239,6 +1056,81 @@ static void execute_command(char *line) {
 
     if (strcmp(line, "clear") == 0) {
         console_clear();
+        return;
+    }
+
+    if (strcmp(line, "pwd") == 0) {
+        cmd_pwd();
+        return;
+    }
+
+    if (strcmp(line, "ls") == 0) {
+        cmd_ls(line + strlen(line));
+        return;
+    }
+
+    if (strncmp(line, "ls ", 3) == 0) {
+        cmd_ls(line + 3);
+        return;
+    }
+
+    if (strcmp(line, "cd") == 0) {
+        cmd_cd(line + strlen(line));
+        return;
+    }
+
+    if (strncmp(line, "cd ", 3) == 0) {
+        cmd_cd(line + 3);
+        return;
+    }
+
+    if (strncmp(line, "mkdir ", 6) == 0) {
+        cmd_mkdir(line + 6);
+        return;
+    }
+
+    if (strcmp(line, "mkdir") == 0) {
+        cmd_mkdir(line + strlen(line));
+        return;
+    }
+
+    if (strncmp(line, "touch ", 6) == 0) {
+        cmd_touch(line + 6);
+        return;
+    }
+
+    if (strcmp(line, "touch") == 0) {
+        cmd_touch(line + strlen(line));
+        return;
+    }
+
+    if (strncmp(line, "cat ", 4) == 0) {
+        cmd_cat(line + 4);
+        return;
+    }
+
+    if (strcmp(line, "cat") == 0) {
+        cmd_cat(line + strlen(line));
+        return;
+    }
+
+    if (strncmp(line, "write ", 6) == 0) {
+        cmd_write(line + 6, false);
+        return;
+    }
+
+    if (strcmp(line, "write") == 0) {
+        cmd_write(line + strlen(line), false);
+        return;
+    }
+
+    if (strncmp(line, "append ", 7) == 0) {
+        cmd_write(line + 7, true);
+        return;
+    }
+
+    if (strcmp(line, "append") == 0) {
+        cmd_write(line + strlen(line), true);
         return;
     }
 
@@ -277,6 +1169,36 @@ static void execute_command(char *line) {
         return;
     }
 
+    if (strcmp(line, "kbdctl") == 0) {
+        cmd_kbdctl(line + strlen(line));
+        return;
+    }
+
+    if (strncmp(line, "kbdctl ", 7) == 0) {
+        cmd_kbdctl(line + 7);
+        return;
+    }
+
+    if (strcmp(line, "showkey") == 0) {
+        cmd_showkey(line + strlen(line));
+        return;
+    }
+
+    if (strncmp(line, "showkey ", 8) == 0) {
+        cmd_showkey(line + 8);
+        return;
+    }
+
+    if (strcmp(line, "storaged") == 0) {
+        cmd_storaged(line + strlen(line));
+        return;
+    }
+
+    if (strncmp(line, "storaged ", 9) == 0) {
+        cmd_storaged(line + 9);
+        return;
+    }
+
     if (strcmp(line, "echo") == 0) {
         console_putc('\n');
         return;
@@ -293,8 +1215,48 @@ static void execute_command(char *line) {
     console_putc('\n');
 }
 
+static void shell_handle_input_byte(char c) {
+    if (c == 0x03) {
+        shell_len = 0;
+        shell_prompt();
+        return;
+    }
+
+    if (c == 0x0C) {
+        console_clear();
+        shell_prompt();
+        if (shell_len > 0) {
+            console_write(shell_line);
+        }
+        return;
+    }
+
+    if (c == '\n') {
+        shell_line[shell_len] = '\0';
+        execute_command(shell_line);
+        shell_len = 0;
+        shell_prompt();
+        return;
+    }
+
+    if (c == 0x04) {
+        return;
+    }
+
+    if (((unsigned char)c < 0x20 || c == 0x7F) && c != '\t') {
+        return;
+    }
+
+    if (shell_len + 1 < SHELL_LINE_MAX) {
+        shell_line[shell_len++] = c;
+    }
+}
+
 void shell_init(void) {
     shell_len = 0;
+    showkey_head = 0;
+    showkey_count = 0;
+    showkey_live = false;
     tty_set_canonical(true);
     tty_set_echo(true);
     shell_prompt();
@@ -304,7 +1266,9 @@ void shell_poll(void) {
     char c;
     int pty_id;
     uint8_t pty_buf[128];
+
     tty_poll_input();
+    collect_keyboard_events();
 
     pty_id = session_active_pty();
 
@@ -315,81 +1279,13 @@ void shell_poll(void) {
                 break;
             }
             for (size_t i = 0; i < r; i++) {
-                c = (char)pty_buf[i];
-
-                if (c == 0x03) {
-                    shell_len = 0;
-                    shell_prompt();
-                    continue;
-                }
-
-                if (c == 0x0C) {
-                    console_clear();
-                    shell_prompt();
-                    if (shell_len > 0) {
-                        console_write(shell_line);
-                    }
-                    continue;
-                }
-
-                if (c == '\n') {
-                    shell_line[shell_len] = '\0';
-                    execute_command(shell_line);
-                    shell_len = 0;
-                    shell_prompt();
-                    continue;
-                }
-
-                if (c == 0x04) {
-                    continue;
-                }
-
-                if (((unsigned char)c < 0x20 || c == 0x7F) && c != '\t') {
-                    continue;
-                }
-
-                if (shell_len + 1 < SHELL_LINE_MAX) {
-                    shell_line[shell_len++] = c;
-                }
+                shell_handle_input_byte((char)pty_buf[i]);
             }
         }
         return;
     }
 
     while (tty_pop_char(&c)) {
-        if (c == 0x03) {
-            shell_len = 0;
-            shell_prompt();
-            continue;
-        }
-
-        if (c == 0x0C) {
-            console_clear();
-            shell_prompt();
-            if (shell_len > 0) {
-                console_write(shell_line);
-            }
-            continue;
-        }
-
-        if (c == '\n') {
-            shell_line[shell_len] = '\0';
-            execute_command(shell_line);
-            shell_len = 0;
-            shell_prompt();
-            continue;
-        }
-
-        if (c == 0x04) {
-            continue;
-        }
-
-        if (((unsigned char)c < 0x20 || c == 0x7F) && c != '\t') {
-            continue;
-        }
-
-        if (shell_len + 1 < SHELL_LINE_MAX) {
-            shell_line[shell_len++] = c;
-        }
+        shell_handle_input_byte(c);
     }
 }

@@ -30,6 +30,8 @@ C_SRCS := \
 	kernel/src/core/tty.c \
 	kernel/src/core/pty.c \
 	kernel/src/core/session.c \
+	kernel/src/core/fs.c \
+	kernel/src/core/storage.c \
 	kernel/src/core/video.c \
 	kernel/src/core/font8x8.c \
 	kernel/src/core/shell.c \

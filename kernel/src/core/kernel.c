@@ -1,4 +1,5 @@
 #include <kernel/console.h>
+#include <kernel/fs.h>
 #include <kernel/idt.h>
 #include <kernel/io.h>
 #include <kernel/keyboard.h>
@@ -10,6 +11,7 @@
 #include <kernel/rust.h>
 #include <kernel/session.h>
 #include <kernel/shell.h>
+#include <kernel/storage.h>
 #include <kernel/tty.h>
 #include <kernel/video.h>
 #include <kernel/vmm.h>
@@ -66,6 +68,8 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr) {
     tty_init();
     pty_init();
     session_init();
+    fs_init();
+    storage_init();
 
     {
         int sid = session_create(1);
