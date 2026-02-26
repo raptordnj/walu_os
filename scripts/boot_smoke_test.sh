@@ -6,8 +6,8 @@ cd "$ROOT_DIR"
 
 BOOTSTRAP_LOG="/tmp/walu_toolchain_bootstrap.log"
 ISO_LOG="/tmp/walu_make_iso.log"
-BOOT_LOG="/tmp/walu_boot_smoke.log"
-rm -f "$BOOTSTRAP_LOG" "$ISO_LOG" "$BOOT_LOG"
+UEFI_BOOT_LOG="/tmp/walu_boot_smoke_uefi.log"
+rm -f "$BOOTSTRAP_LOG" "$ISO_LOG" "$UEFI_BOOT_LOG"
 
 require_tool() {
   local name="$1"
@@ -32,9 +32,9 @@ dump_logs_on_error() {
     echo "----- make iso log -----" >&2
     tail -n 120 "$ISO_LOG" >&2 || true
   fi
-  if [[ -f "$BOOT_LOG" ]]; then
-    echo "----- qemu boot log -----" >&2
-    tail -n 120 "$BOOT_LOG" >&2 || true
+  if [[ -f "$UEFI_BOOT_LOG" ]]; then
+    echo "----- qemu uefi boot log -----" >&2
+    tail -n 160 "$UEFI_BOOT_LOG" >&2 || true
   fi
 }
 trap 'dump_logs_on_error $?' EXIT
@@ -50,52 +50,74 @@ require_tool timeout
 
 make iso >"$ISO_LOG" 2>&1
 
+find_uefi_firmware() {
+  local code=""
+  local vars=""
+
+  for p in \
+    /usr/share/OVMF/OVMF_CODE_4M.fd \
+    /usr/share/OVMF/OVMF_CODE.fd; do
+    if [[ -f "$p" ]]; then
+      code="$p"
+      break
+    fi
+  done
+
+  for p in \
+    /usr/share/OVMF/OVMF_VARS_4M.fd \
+    /usr/share/OVMF/OVMF_VARS.fd; do
+    if [[ -f "$p" ]]; then
+      vars="$p"
+      break
+    fi
+  done
+
+  if [[ -z "$code" || -z "$vars" ]]; then
+    echo "missing required UEFI firmware files (install package: ovmf)" >&2
+    return 1
+  fi
+
+  printf '%s\n%s\n' "$code" "$vars"
+}
+
+mapfile -t firmware_paths < <(find_uefi_firmware)
+UEFI_CODE="${firmware_paths[0]}"
+UEFI_VARS_TEMPLATE="${firmware_paths[1]}"
+UEFI_VARS_RUNTIME="/tmp/walu_ovmf_vars.fd"
+cp -f "$UEFI_VARS_TEMPLATE" "$UEFI_VARS_RUNTIME"
+
 set +e
-timeout 20s qemu-system-x86_64 \
+timeout 25s qemu-system-x86_64 \
+  -machine q35 \
+  -m 512M \
+  -drive if=pflash,format=raw,readonly=on,file="$UEFI_CODE" \
+  -drive if=pflash,format=raw,file="$UEFI_VARS_RUNTIME" \
   -cdrom build/waluos.iso \
-  -m 256M \
   -serial stdio \
   -display none \
   -no-reboot \
-  -no-shutdown >"$BOOT_LOG" 2>&1
+  -no-shutdown >"$UEFI_BOOT_LOG" 2>&1
 QEMU_RC=$?
 set -e
-
-HAS_READY_MARKER=0
-HAS_FB_MARKER=0
-if grep -q "Kernel ready. Type \`help\`." "$BOOT_LOG"; then
-  HAS_READY_MARKER=1
-fi
-if grep -Eq "Framebuffer console enabled|Framebuffer console unavailable" "$BOOT_LOG"; then
-  HAS_FB_MARKER=1
-fi
-
-if [[ "$HAS_READY_MARKER" -eq 1 && "$HAS_FB_MARKER" -eq 1 ]]; then
-  if [[ "$QEMU_RC" -ne 0 && "$QEMU_RC" -ne 124 ]]; then
-    echo "boot smoke failed: qemu exited with code $QEMU_RC" >&2
-    exit 1
-  fi
-  echo "boot smoke test passed"
-  exit 0
-fi
-
-# Fallback for builds that do not mirror console output to serial:
-# accept timeout-based runtime if no fatal errors are visible.
-if [[ "$QEMU_RC" -eq 124 ]]; then
-  if grep -Eqi "triple fault|fatal|panic|aborted|assert" "$BOOT_LOG"; then
-    echo "boot smoke failed: fatal keyword detected in qemu log" >&2
-    cat "$BOOT_LOG" >&2
-    exit 1
-  fi
-  echo "boot smoke test passed (timeout fallback: serial boot marker unavailable)"
-  exit 0
-fi
 
 if [[ "$QEMU_RC" -ne 0 && "$QEMU_RC" -ne 124 ]]; then
   echo "boot smoke failed: qemu exited with code $QEMU_RC" >&2
   exit 1
 fi
 
-echo "boot smoke failed: serial boot markers missing and qemu did not reach timeout fallback" >&2
-cat "$BOOT_LOG" >&2
-exit 1
+if grep -Eq "unsupported tag:|you need to load the kernel first|Failed to boot both default and fallback entries|Invalid multiboot2 magic" "$UEFI_BOOT_LOG"; then
+  echo "boot smoke failed: bootloader/kernel handoff error detected" >&2
+  exit 1
+fi
+
+if ! grep -q "Kernel ready. Type \`help\`." "$UEFI_BOOT_LOG"; then
+  echo "boot smoke failed: kernel ready marker not found in UEFI run" >&2
+  exit 1
+fi
+
+if ! grep -q "Multiboot2 handoff OK" "$UEFI_BOOT_LOG"; then
+  echo "boot smoke failed: multiboot2 handoff marker missing in UEFI run" >&2
+  exit 1
+fi
+
+echo "boot smoke test passed (UEFI)"

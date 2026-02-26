@@ -49,7 +49,7 @@ make test
 ```
 
 ## Boot smoke test (QEMU + ISO)
-Requires host tools: `grub-mkrescue`, `xorriso`, `mtools` (`mformat`), `qemu-system-x86_64`, `timeout`.
+Requires host tools: `grub-mkrescue`, `xorriso`, `mtools` (`mformat`), `qemu-system-x86_64`, `timeout`, and UEFI firmware files from `ovmf`.
 ```bash
 make boot-smoke
 ```
@@ -117,3 +117,8 @@ docker run --rm -it -v "$PWD":/workspace waluos make run-headless
 - `docs/interfaces/` syscall/procfs/input/tty interface sketches
 - `skills/` local reusable skill workflows (`skills/*/SKILL.md`)
 - `userland/` host-buildable service scaffolding binaries
+
+## Project Policies
+- Contribution guide: `CONTRIBUTING.md`
+- Security policy: `SECURITY.md`
+- Ownership rules: `.github/CODEOWNERS`
