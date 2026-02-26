@@ -1,0 +1,7 @@
+build/
+rust/target/
+userland/build/
+dist/
+toolchain/
+.local/
+.local-build/

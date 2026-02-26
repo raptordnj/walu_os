@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenSSH Daemon
+After=network.target
+Requires=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/sshd -D
+Restart=on-failure
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

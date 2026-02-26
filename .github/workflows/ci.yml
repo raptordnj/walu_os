@@ -1,0 +1,63 @@
+name: waluos-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  userland-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and test userland
+        run: |
+          make userland
+          make test-userland
+
+  kernel-host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run kernel host checks
+        run: make test-kernel
+
+  boot-smoke-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+      - userland-tests
+      - kernel-host-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install boot tool dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y grub-pc-bin xorriso mtools qemu-system-x86
+
+      - name: Add Rust target
+        run: rustup target add x86_64-unknown-none
+
+      - name: Run boot smoke test
+        run: make boot-smoke
+
+      - name: Package build artifacts
+        run: |
+          make userland
+          make package-artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: waluos-artifacts
+          path: |
+            build/waluos.iso
+            dist/waluos-artifacts.tar.gz
+            dist/waluos-artifacts.tar.gz.sha256

@@ -1,0 +1,13 @@
+[keyboard]
+layout = "us"
+variant = ""
+model = "pc105"
+options = ["caps:escape"]
+
+[repeat]
+delay_ms = 250
+rate_hz = 30
+
+[compose]
+enabled = true
+table = "en_US.UTF-8"

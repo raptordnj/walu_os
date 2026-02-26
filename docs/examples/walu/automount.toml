@@ -1,0 +1,9 @@
+[default]
+mount_root = "/media"
+options = ["nosuid", "nodev", "noexec", "relatime"]
+unknown_read_only = true
+duplicate_suffix = "-{n}"
+
+[trusted]
+uuid = ["1234-ABCD"]
+allow_exec = false

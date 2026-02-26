@@ -1,0 +1,12 @@
+Use `AGENTS.md` as the repository instruction file.
+
+Key references:
+- `AGENTS.md`
+- `docs/WALUOS_SYSTEM_BLUEPRINT.md`
+- `skills/`
+
+Validation entrypoints:
+- `make test-kernel`
+- `make test-userland`
+- `make boot-smoke`
+- `make package-artifacts`
