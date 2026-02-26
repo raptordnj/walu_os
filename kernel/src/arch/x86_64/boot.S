@@ -13,7 +13,7 @@ multiboot_header_start:
 
     # Framebuffer request tag (type=5, optional)
     .short 5
-    .short 0
+    .short 1
     .long 20
     .long 1024
     .long 768
