@@ -13,6 +13,11 @@ require_tool() {
   fi
 }
 
+has_tool() {
+  local name="$1"
+  command -v "$name" >/dev/null 2>&1 || [[ -x "$BIN_DIR/$name" ]]
+}
+
 link_or_wrap() {
   local target_name="$1"
   local host_name="$2"
@@ -38,7 +43,7 @@ link_or_wrap x86_64-elf-ar ar
 link_or_wrap x86_64-elf-objcopy objcopy
 
 for tool in grub-mkrescue xorriso mformat qemu-system-x86_64 timeout; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
+  if ! has_tool "$tool"; then
     echo "warning: optional host tool not found: $tool" >&2
   fi
 done

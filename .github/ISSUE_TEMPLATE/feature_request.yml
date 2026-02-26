@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a concrete enhancement with scope and acceptance criteria.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      placeholder: What limitation are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      placeholder: Describe architecture, interfaces, and behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and milestones
+      placeholder: MVP scope, what is explicitly out of scope, follow-up phases.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: Testable conditions that must be met.
+    validations:
+      required: true

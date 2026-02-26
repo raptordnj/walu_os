@@ -117,3 +117,8 @@ docker run --rm -it -v "$PWD":/workspace waluos make run-headless
 - `docs/interfaces/` syscall/procfs/input/tty interface sketches
 - `skills/` local reusable skill workflows (`skills/*/SKILL.md`)
 - `userland/` host-buildable service scaffolding binaries
+
+## Project Policies
+- Contribution guide: `CONTRIBUTING.md`
+- Security policy: `SECURITY.md`
+- Ownership rules: `.github/CODEOWNERS`
