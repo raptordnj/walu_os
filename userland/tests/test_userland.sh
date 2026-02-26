@@ -56,14 +56,32 @@ expect_failure "authd policy rejects short password" \
 expect_failure "storaged rejects non-block char device" \
   "$BIN_DIR/storaged" format --device /dev/null --dry-run
 
+expect_failure "storaged mount rejects invalid target" \
+  "$BIN_DIR/storaged" mount --device /dev/null --target relative/path --dry-run
+
 expect_failure "authd verify fails for missing user in sample shadow" \
   sh -c "printf '%s\n' 'StrongPass!123' | '$BIN_DIR/authd' verify --user no_such_user --shadow '$ROOT_DIR/docs/examples/etc/shadow' --password-stdin"
 
 expect_success "storaged probe works" \
   "$BIN_DIR/storaged" probe --device /dev/null
 
+expect_success "storaged lsblk command works" \
+  "$BIN_DIR/storaged" lsblk
+
+expect_success "storaged blkid command works" \
+  "$BIN_DIR/storaged" blkid
+
+expect_success "storaged umount dry-run works" \
+  "$BIN_DIR/storaged" umount --target /tmp --dry-run
+
 FIRST_BLOCK_DEV="$(find /dev -maxdepth 1 -type b 2>/dev/null | head -n 1 || true)"
 if [ -n "$FIRST_BLOCK_DEV" ]; then
+  expect_success "storaged mount dry-run valid block device" \
+    "$BIN_DIR/storaged" mount --device "$FIRST_BLOCK_DEV" --target /tmp --dry-run
+
+  expect_success "storaged fsck dry-run valid block device" \
+    "$BIN_DIR/storaged" fsck --device "$FIRST_BLOCK_DEV" --dry-run
+
   expect_success "storaged dry-run valid block device" \
     "$BIN_DIR/storaged" format --device "$FIRST_BLOCK_DEV" --dry-run
 
