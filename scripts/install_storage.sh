@@ -212,7 +212,30 @@ prepare_disk_grub_config() {
   local source_cfg="$1"
   local out_cfg="$2"
 
-  cp "$source_cfg" "$out_cfg"
+  cat >"$out_cfg" <<'EOF'
+set timeout=1
+set default=0
+terminal_input console
+insmod all_video
+insmod efi_gop
+insmod efi_uga
+insmod gfxterm
+if loadfont /boot/grub/fonts/unicode.pf2; then
+    terminal_output gfxterm
+else
+    terminal_output console
+fi
+insmod part_gpt
+insmod fat
+search --no-floppy --file /boot/kernel.elf --set=root
+menuentry "WaluOS" {
+    multiboot2 ($root)/boot/kernel.elf
+    boot
+}
+EOF
+  if [[ -n "$source_cfg" ]]; then
+    :
+  fi
 }
 
 TARGET_DEVICE=""
@@ -496,7 +519,7 @@ fi
 run_cmd grub-mkstandalone \
   -O x86_64-efi \
   -o "$ESP_MNT/EFI/BOOT/BOOTX64.EFI" \
-  --modules="part_gpt part_msdos fat ext2 normal multiboot2 search search_fs_file configfile" \
+  --modules="part_gpt part_msdos fat ext2 normal multiboot2 search search_fs_file configfile all_video efi_gop efi_uga gfxterm" \
   "boot/grub/grub.cfg=$DISK_GRUB_CFG"
 
 cat >"$ESP_MNT/startup.nsh" <<'EOF'
