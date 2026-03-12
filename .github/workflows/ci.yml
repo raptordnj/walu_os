@@ -54,7 +54,7 @@ jobs:
           make package-artifacts
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: waluos-artifacts
           path: |
